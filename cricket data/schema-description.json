@@ -1,0 +1,94 @@
+{
+  "note": "Player names ARE available via the 'players' collection which maps player_id to full_name, country, and other info. The backend automatically enriches query results with player names before formatting.",
+  "collections": {
+    "players": {
+      "description": "Player identity information — maps player_id to name and country.",
+      "fields": {
+        "player_id": "Unique numeric player identifier (ESPN Cricinfo ID)",
+        "full_name": "Player's full name",
+        "short_name": "Player's short/display name",
+        "active": "Whether the player is active",
+        "date_of_birth": "Date of birth",
+        "country": "Player's country/team",
+        "batting_style": "Batting style (e.g. Right-hand bat)",
+        "bowling_style": "Bowling style (e.g. Right-arm fast)"
+      }
+    },
+    "players_yearly": {
+      "description": "Player career statistics aggregated per year and format. No player names — only player_id.",
+      "fields": {
+        "player_id": "Unique numeric player identifier (ESPN Cricinfo ID)",
+        "year": "Year of the statistics (number)",
+        "matches": "Number of matches played",
+        "runs": "Total runs scored",
+        "highest_score": "Highest score in an innings (string, e.g. '41*' means not out)",
+        "average": "Batting average",
+        "hundreds": "Number of centuries (100+ runs)",
+        "wickets": "Total wickets taken",
+        "best_bowling": "Best bowling figures in an innings (string, e.g. '5/44')",
+        "bowl_avg": "Bowling average",
+        "five_wicket_hauls": "Number of five-wicket hauls",
+        "catches": "Total catches taken",
+        "stumpings": "Total stumpings",
+        "ave_diff": "Difference between batting and bowling average",
+        "format": "Format of cricket: 'T20I', 'ODI', or 'Test'",
+        "id": "Record identifier (row number)"
+      }
+    },
+    "players_matches": {
+      "description": "Player statistics for each individual match. No player names — only player_id.",
+      "fields": {
+        "player_id": "Unique numeric player identifier (ESPN Cricinfo ID)",
+        "date": "Match date (ISO string, e.g. '2024-03-15')",
+        "format": "Format of cricket: 'T20I', 'ODI', or 'Test'",
+        "opponent": "Opposition team name",
+        "venue": "Ground/stadium name",
+        "result": "Match result: 'Won' or 'Lost'",
+        "innings": "Innings number (1 or 2), or 0 for DNB (did not bat)",
+        "not_out": "Whether the player was not out: 'Not out', 'Out', or 'DNB'",
+        "runs_str": "Runs scored as string (may include '*' for not out, or 'DNB')",
+        "runs": "Runs scored as number",
+        "balls": "Balls faced as number",
+        "fours": "Number of fours hit",
+        "sixes": "Number of sixes hit",
+        "strike_rate": "Batting strike rate",
+        "ducks": "1 if the player scored 0 and was out, else 0",
+        "overs": "Overs bowled",
+        "maidens": "Maiden overs bowled",
+        "runs_conceded": "Runs conceded while bowling",
+        "wickets_bowling": "Wickets taken while bowling",
+        "economy": "Bowling economy rate",
+        "bowling_average": "Bowling average for this match",
+        "bowling_strike_rate": "Bowling strike rate for this match",
+        "match_ref": "Match reference identifier (e.g. 'T20I # 2521')",
+        "year": "Year of the match",
+        "dismissals": "Total dismissals (catches + stumpings)",
+        "catches": "Catches taken in the match",
+        "stumpings": "Stumpings made in the match",
+        "catches_as_wicketkeeper": "Catches taken as wicketkeeper",
+        "catches_in_field": "Catches taken in the field",
+        "team": "Player's team name",
+        "fifties": "1 if player scored 50-99, else 0",
+        "centuries": "1 if player scored 100+, else 0"
+      }
+    },
+    "team_matches": {
+      "description": "Team-level results and scores for each match innings.",
+      "fields": {
+        "team": "Team name",
+        "opponent": "Opposition team name",
+        "date": "Match start date (ISO string)",
+        "format": "Format of cricket: 'T20I', 'ODI', or 'Test'",
+        "venue": "Ground/stadium name",
+        "result": "Match result: 'won' or 'lost'",
+        "margin": "Winning margin (e.g. '6 wickets', '50 runs')",
+        "toss": "Toss result: 'won' or 'lost'",
+        "batting": "Whether team batted '1st' or '2nd'",
+        "score": "Total runs scored",
+        "wickets": "Wickets lost",
+        "overs": "Overs played",
+        "run_rate": "Run rate (runs per over)"
+      }
+    }
+  }
+}
