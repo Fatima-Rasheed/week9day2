@@ -35,10 +35,7 @@ export class LangGraphService {
     private configService: ConfigService,
     private databaseService: DatabaseService,
   ) {
-    const projectRoot = process.env.PROJECT_ROOT
-      ? resolve(process.env.PROJECT_ROOT)
-      : resolve(process.cwd(), '..');
-    const schemaPath = join(projectRoot, 'cricket data', 'schema-description.json');
+const schemaPath = join(__dirname, '..', '..', 'cricket data', 'schema-description.json');
 
     console.log('Looking for schema at:', schemaPath);
 
