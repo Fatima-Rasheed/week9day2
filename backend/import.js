@@ -144,7 +144,11 @@ async function importAll() {
     process.exit(1);
   }
 
-  const client = new MongoClient(uri);
+  const client = new MongoClient(uri, {
+    serverSelectionTimeoutMS: 30000,
+    socketTimeoutMS: 120000,
+    connectTimeoutMS: 30000,
+  });
   await client.connect();
   console.log('✅ MongoDB Connected');
 

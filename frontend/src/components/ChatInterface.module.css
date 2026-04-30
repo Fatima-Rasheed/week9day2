@@ -48,13 +48,13 @@
   align-items: center;
   justify-content: center;
   font-size: 2.25rem;
-  box-shadow: 0 8px 32px rgba(88,166,255,0.35), 0 0 0 8px rgba(88,166,255,0.08);
+  box-shadow: 0 8px 32px rgba(63,185,80,0.35), 0 0 0 8px rgba(63,185,80,0.08);
   animation: pulse 3s ease-in-out infinite;
 }
 
 @keyframes pulse {
-  0%, 100% { box-shadow: 0 8px 32px rgba(88,166,255,0.35), 0 0 0 8px rgba(88,166,255,0.08); }
-  50%      { box-shadow: 0 8px 32px rgba(88,166,255,0.5),  0 0 0 16px rgba(88,166,255,0.04); }
+  0%, 100% { box-shadow: 0 8px 32px rgba(63,185,80,0.35), 0 0 0 8px rgba(63,185,80,0.08); }
+  50%      { box-shadow: 0 8px 32px rgba(63,185,80,0.5),  0 0 0 16px rgba(63,185,80,0.04); }
 }
 
 .welcomeTitle {
@@ -152,7 +152,7 @@
 .suggestionButton:hover {
   border-color: var(--accent);
   transform: translateY(-3px);
-  box-shadow: 0 8px 24px rgba(88,166,255,0.15);
+  box-shadow: 0 8px 24px rgba(63,185,80,0.15);
   color: var(--accent);
   background: var(--midnight-700);
 }
@@ -199,7 +199,7 @@
 .avatarUser {
   background: linear-gradient(135deg, var(--accent-dark), var(--accent));
   color: white;
-  box-shadow: 0 2px 8px rgba(88,166,255,0.35);
+  box-shadow: 0 2px 8px rgba(63,185,80,0.35);
 }
 
 .avatarBot {
@@ -260,7 +260,7 @@
   background: linear-gradient(135deg, var(--accent-dark) 0%, var(--accent) 100%);
   color: white;
   border-bottom-right-radius: 5px;
-  box-shadow: 0 4px 20px rgba(88,166,255,0.3);
+  box-shadow: 0 4px 20px rgba(63,185,80,0.3);
 }
 
 .assistant {
@@ -482,7 +482,7 @@
 .input:focus {
   border-color: var(--accent);
   background: var(--midnight-800);
-  box-shadow: 0 0 0 4px rgba(88,166,255,0.1);
+  box-shadow: 0 0 0 4px rgba(63,185,80,0.1);
 }
 
 .input:disabled {
@@ -515,13 +515,13 @@
   font-size: 1.2rem;
   cursor: pointer;
   transition: transform 0.2s, box-shadow 0.2s, opacity 0.2s;
-  box-shadow: 0 4px 20px rgba(88,166,255,0.35);
+  box-shadow: 0 4px 20px rgba(63,185,80,0.35);
   flex-shrink: 0;
 }
 
 .sendButton:hover:not(:disabled) {
   transform: translateY(-2px) scale(1.05);
-  box-shadow: 0 8px 24px rgba(88,166,255,0.5);
+  box-shadow: 0 8px 24px rgba(63,185,80,0.5);
 }
 
 .sendButton:active:not(:disabled) {

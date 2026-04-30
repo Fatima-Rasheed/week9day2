@@ -31,12 +31,10 @@ function formatTime(date: Date): string {
 const STORAGE_KEY = 'cricket_ai_messages';
 
 function loadMessages(): Message[] {
-  if (typeof window === 'undefined') return [];
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
+    const raw = sessionStorage.getItem(STORAGE_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw) as Array<Omit<Message, 'timestamp'> & { timestamp: string }>;
-    // Revive timestamp strings back into Date objects
     return parsed.map(m => ({ ...m, timestamp: new Date(m.timestamp) }));
   } catch {
     return [];
@@ -45,24 +43,31 @@ function loadMessages(): Message[] {
 
 function saveMessages(msgs: Message[]) {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(msgs));
+    sessionStorage.setItem(STORAGE_KEY, JSON.stringify(msgs));
   } catch {
     // storage quota exceeded — fail silently
   }
 }
 
 export default function ChatInterface() {
-  const [messages, setMessages] = useState<Message[]>(() => loadMessages());
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [hydrated, setHydrated] = useState(false);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
   const [copiedIdx, setCopiedIdx] = useState<number | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  // Persist messages to localStorage whenever they change
+  // Load from localStorage only on client after mount
   useEffect(() => {
-    saveMessages(messages);
-  }, [messages]);
+    setMessages(loadMessages());
+    setHydrated(true);
+  }, []);
+
+  // Persist messages to localStorage whenever they change (only after hydration)
+  useEffect(() => {
+    if (hydrated) saveMessages(messages);
+  }, [messages, hydrated]);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -209,11 +214,14 @@ export default function ChatInterface() {
 
   const handleClearChat = () => {
     setMessages([]);
-    localStorage.removeItem(STORAGE_KEY);
+    sessionStorage.removeItem(STORAGE_KEY);
   };
 
   const charLimit = 300;
   const charLeft = charLimit - input.length;
+
+  // Don't render until client-side hydration is complete
+  if (!hydrated) return null;
 
   return (
     <div className={styles.chatContainer}>

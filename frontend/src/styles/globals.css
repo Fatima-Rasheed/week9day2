@@ -22,11 +22,11 @@
   --midnight-100: #c9d1d9;
   --midnight-50:  #f0f6fc;
 
-  /* Accent — electric blue */
-  --accent:        #58a6ff;
-  --accent-light:  #cae8ff;
-  --accent-dark:   #1f6feb;
-  --accent-glow:   rgba(88,166,255,0.25);
+  /* Accent — emerald green */
+  --accent:        #3fb950;
+  --accent-light:  #aff5b4;
+  --accent-dark:   #238636;
+  --accent-glow:   rgba(63,185,80,0.25);
 
   /* Secondary accent — purple */
   --purple:        #bc8cff;
@@ -54,18 +54,18 @@
   --shadow-sm:    0 1px 3px rgba(0,0,0,0.4);
   --shadow-md:    0 4px 16px rgba(0,0,0,0.5);
   --shadow-lg:    0 8px 32px rgba(0,0,0,0.6);
-  --shadow-green: 0 4px 20px rgba(88,166,255,0.3);
+  --shadow-green: 0 4px 20px rgba(63,185,80,0.3);
 }
 
 /* ═══════════════════════════════════════════════════════════
    LIGHT THEME
 ═══════════════════════════════════════════════════════════ */
 [data-theme="light"] {
-  /* Accent — blue */
-  --accent:        #0969da;
-  --accent-light:  #dbeafe;
-  --accent-dark:   #0550ae;
-  --accent-glow:   rgba(9,105,218,0.15);
+  /* Accent — green */
+  --accent:        #1a7f37;
+  --accent-light:  #d1f7d6;
+  --accent-dark:   #116329;
+  --accent-glow:   rgba(26,127,55,0.15);
 
   /* Secondary accent — purple */
   --purple:        #8250df;
@@ -106,7 +106,7 @@
   --shadow-sm:    0 1px 3px rgba(31,35,40,0.08);
   --shadow-md:    0 4px 16px rgba(31,35,40,0.12);
   --shadow-lg:    0 8px 32px rgba(31,35,40,0.16);
-  --shadow-green: 0 4px 20px rgba(9,105,218,0.2);
+  --shadow-green: 0 4px 20px rgba(26,127,55,0.2);
 }
 
 /* ═══════════════════════════════════════════════════════════

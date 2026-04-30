@@ -2,8 +2,6 @@ import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { DatabaseService } from '../database/database.service';
 import axios from 'axios';
-import { readFileSync, existsSync } from 'fs';
-import { join, resolve } from 'path';
 
 interface WorkflowState {
   question: string;
@@ -27,6 +25,34 @@ const GROQ_MODEL_CHAIN = [
   'mixtral-8x7b-32768',
 ];
 
+// ─────────────────────────────────────────────────────────────────────────────
+// SHARED CONSTANTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Words that should never be treated as a player name.
+ * Tests a single-word capture group.
+ */
+const GENERIC_SINGLE_WORD =
+  /^(?:a|the|this|that|team|player|match|game|cricket|all|any|every|which|what|who|how|when|where|why|me|us|him|her|them|it|did|has|have|had|is|was|were|are|be|been|being)$/i;
+
+/**
+ * Multi-word phrases that look like a name extraction but aren't.
+ * e.g. "this player", "the player", "that team".
+ */
+const GENERIC_PHRASE = /^(this|that|the|a)\s+(player|team|batter|batsman|bowler|match|game|cricketer)$/i;
+
+/**
+ * Returns true when a captured string is a real candidate for a player name.
+ */
+function isValidPlayerName(name: string): boolean {
+  if (!name || name.length < 3) return false;
+  if (GENERIC_SINGLE_WORD.test(name)) return false;
+  if (GENERIC_PHRASE.test(name)) return false;
+  if (/^\d+$/.test(name)) return false; // pure numbers
+  return true;
+}
+
 @Injectable()
 export class LangGraphService {
   private schemaDescription: any;
@@ -35,21 +61,8 @@ export class LangGraphService {
     private configService: ConfigService,
     private databaseService: DatabaseService,
   ) {
-const schemaPath = join(__dirname, '..', '..', 'cricket data', 'schema-description.json');
-
-    console.log('Looking for schema at:', schemaPath);
-
-    if (!existsSync(schemaPath)) {
-      console.error('Schema file not found at:', schemaPath);
-      console.error('Current working directory:', process.cwd());
-      console.error('PROJECT_ROOT env:', process.env.PROJECT_ROOT);
-      throw new Error(
-        `Schema file not found. Please set PROJECT_ROOT environment variable or place schema at: ${schemaPath}`,
-      );
-    }
-
-    this.schemaDescription = JSON.parse(readFileSync(schemaPath, 'utf-8'));
-    console.log('✓ Schema loaded successfully');
+    this.schemaDescription = {};
+    console.log('✓ Schema initialized');
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -97,33 +110,35 @@ const schemaPath = join(__dirname, '..', '..', 'cricket data', 'schema-descripti
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
-  // HELPER: DETECT WHAT DATA IS AVAILABLE FOR A QUESTION
-  // Returns a human-readable message when no results are found, distinguishing
-  // "data not in our dataset" from "no matches for your filter".
+  // HELPER: BUILD NO-RESULTS MESSAGE
   // ─────────────────────────────────────────────────────────────────────────────
 
   private buildNoResultsMessage(state: WorkflowState): string {
-    const q = state.question.toLowerCase();
     const col = state.generatedQuery?.collection ?? '';
 
-    // If the query targeted a specific player by name, say we don't have that player
-    const playerNameMatch = state.question.match(
-      /(?:details?|info(?:rmation)?|profile|stats?|runs?|wickets?|average|centuries|batting|bowling)\s+(?:of|about|on|for|by)?\s+(?:player\s+)?([A-Za-z .'-]{3,40})/i,
-    ) ?? state.question.match(
-      /(?:who\s+is|tell\s+me\s+about)\s+([A-Za-z .'-]{3,40})/i,
-    );
+    // Try to extract a player name from the question
+    const playerNameMatch =
+      state.question.match(
+        /(?:details?|info(?:rmation)?|profile|stats?|runs?|wickets?|average|centuries|batting|bowling)\s+(?:of|about|on|for|by)?\s+(?:player\s+)?([A-Za-z .'-]{3,40})/i,
+      ) ??
+      state.question.match(
+        /(?:who\s+is|tell\s+me\s+about)\s+([A-Za-z .'-]{3,40})/i,
+      );
 
-    if (playerNameMatch && (col === 'players' || col === 'players_yearly' || col === 'players_matches')) {
-      const name = playerNameMatch[1].trim().replace(/[?!.]+$/, '');
-      return `No player named "${name}" was found in the dataset. The dataset covers international cricketers tracked by ESPN Cricinfo. Please check the spelling or try a different name.`;
+    const rawName = playerNameMatch?.[1]?.trim().replace(/[?!.]+$/, '') ?? '';
+
+    // Only use the extracted name if it looks like a real player name
+    if (
+      isValidPlayerName(rawName) &&
+      (col === 'players' || col === 'players_yearly' || col === 'players_matches')
+    ) {
+      return `No player named "${rawName}" was found in the dataset. The dataset covers international cricketers tracked by ESPN Cricinfo. Please check the spelling or try a different name.`;
     }
 
-    // Team-level queries
     if (col === 'team_matches') {
       const filter = state.generatedQuery?.filter ?? {};
       const pipeline = state.generatedQuery?.pipeline;
 
-      // Format filter
       const format = filter.format ?? (pipeline ? this.extractFromPipeline(pipeline, 'format') : null);
       const year = filter.year ?? (pipeline ? this.extractFromPipeline(pipeline, 'year') : null);
       const venue = filter.venue?.$regex ?? (pipeline ? this.extractFromPipeline(pipeline, 'venue') : null);
@@ -143,7 +158,6 @@ const schemaPath = join(__dirname, '..', '..', 'cricket data', 'schema-descripti
       return `No matches found for your query. The dataset covers international cricket matches. Please check team names or filters.`;
     }
 
-    // Generic fallback
     return `No data found for your query. This information may not be available in the dataset, which covers international cricket statistics from ESPN Cricinfo.`;
   }
 
@@ -173,6 +187,7 @@ const schemaPath = join(__dirname, '..', '..', 'cricket data', 'schema-descripti
       const match = state.question.match(pattern);
       if (match) {
         const playerName = match[1].trim().replace(/[?!.]+$/, '');
+        if (!isValidPlayerName(playerName)) continue;
         console.log(`=== RULE-BASED: player profile lookup for "${playerName}" ===`);
         state.generatedQuery = {
           collection: 'players',
@@ -189,9 +204,6 @@ const schemaPath = join(__dirname, '..', '..', 'cricket data', 'schema-descripti
     }
 
     // ── Player career stats (runs/wickets/average) by name ───────────────────
-    // e.g. "How many runs did Babar Azam score in ODIs?"
-    //      "What is Virat Kohli's batting average in Tests?"
-    //      "Rohit Sharma ODI stats"
     const playerStatsPatterns = [
       /(?:how\s+many\s+(?:runs?|wickets?|centuries|fifties|matches?))\s+(?:did|has|have)\s+(.+?)\s+(?:score|take|play|make|get)/i,
       /(?:what\s+(?:is|are|was|were))\s+(.+?)'?s?\s+(?:batting|bowling|career|overall)?\s*(?:stats?|average|record|figures?)/i,
@@ -203,11 +215,8 @@ const schemaPath = join(__dirname, '..', '..', 'cricket data', 'schema-descripti
       const match = state.question.match(pattern);
       if (match) {
         const playerName = match[1].trim().replace(/[?!.]+$/, '');
-        // Avoid matching generic words as player names
-        const genericWords = /^(?:a|the|this|that|team|player|match|game|cricket|all|any|every|which|what|who|how|when|where|why)$/i;
-        if (genericWords.test(playerName) || playerName.length < 3) continue;
+        if (!isValidPlayerName(playerName)) continue;
 
-        // Detect format from question
         let format: string | null = null;
         const fmtMatch = state.question.match(/\b(odi|t20i?|test)\b/i);
         if (fmtMatch) {
@@ -216,19 +225,11 @@ const schemaPath = join(__dirname, '..', '..', 'cricket data', 'schema-descripti
         }
 
         console.log(`=== RULE-BASED: player career stats for "${playerName}" format=${format} ===`);
-
-        // First look up the player_id, then query players_yearly
-        // We do this as a two-step pipeline via $lookup equivalent:
-        // Use players_yearly with a sub-lookup — but MongoDB doesn't support cross-collection
-        // in a simple find. Instead, we'll query players collection and let executeQuery
-        // enrich. Actually we need player_id first. Use a special marker so executeQuery
-        // can do the two-step lookup.
         state.generatedQuery = {
           collection: 'players_yearly',
           _playerNameLookup: playerName,
           _format: format,
           pipeline: [
-            // Placeholder — will be replaced in executeQuery after player_id lookup
             { $match: { player_id: -1 } },
           ],
         };
@@ -237,7 +238,6 @@ const schemaPath = join(__dirname, '..', '..', 'cricket data', 'schema-descripti
     }
 
     // ── Top run scorers / wicket takers ───────────────────────────────────────
-    // e.g. "Who scored the most runs in ODIs?", "Top 10 wicket takers in T20Is"
     const topRunsPattern = /(?:top|most|highest|best|leading)\s+(?:\d+\s+)?(?:run\s+scorers?|batsmen?|batters?|runs?\s+(?:in|scored))/i;
     const topWicketsPattern = /(?:top|most|highest|best|leading)\s+(?:\d+\s+)?(?:wicket\s+takers?|bowlers?|wickets?\s+(?:in|taken))/i;
 
@@ -307,8 +307,7 @@ const schemaPath = join(__dirname, '..', '..', 'cricket data', 'schema-descripti
     const teamMatchCountMatch = state.question.match(teamMatchCountPattern);
     if (teamMatchCountMatch) {
       const teamName = teamMatchCountMatch[1].trim().replace(/[?!.]+$/, '');
-      const genericWords2 = /^(?:a|the|this|that|team|player|match|game|cricket|all|any|every|which|what|who|how|when|where|why)$/i;
-      if (!genericWords2.test(teamName) && teamName.length >= 3) {
+      if (isValidPlayerName(teamName)) {
         const fmtM = state.question.match(/\b(odi|t20i?|test)\b/i);
         const fmt = fmtM ? (fmtM[1].toUpperCase() === 'T20' ? 'T20I' : fmtM[1].toUpperCase()) : null;
         const matchStage: any = { team: { $regex: teamName, $options: 'i' } };
@@ -332,8 +331,7 @@ const schemaPath = join(__dirname, '..', '..', 'cricket data', 'schema-descripti
       const teamName = teamRecordMatch[1].trim().replace(/[?!.]+$/, '');
       const fmtRaw = teamRecordMatch[2];
       const fmt = fmtRaw ? (fmtRaw.toUpperCase() === 'T20' ? 'T20I' : fmtRaw.toUpperCase()) : null;
-      const genericWords3 = /^(?:a|the|this|that|team|player|match|game|cricket|all|any|every)$/i;
-      if (!genericWords3.test(teamName) && teamName.length >= 3) {
+      if (isValidPlayerName(teamName)) {
         const matchStage: any = { team: { $regex: teamName, $options: 'i' } };
         if (fmt) matchStage.format = fmt;
         console.log(`=== RULE-BASED: win-loss record for team "${teamName}" format=${fmt} ===`);
@@ -355,14 +353,12 @@ const schemaPath = join(__dirname, '..', '..', 'cricket data', 'schema-descripti
     }
 
     // ── Match list by format / year / venue ───────────────────────────────────
-    // e.g. "Show all ODI matches in 2023", "List T20I matches at Lord's"
     const matchListPattern =
       /(?:show|list|find|get|display)(?:\s+me)?(?:\s+all)?\s+(odi|t20i?|test)\s+matches?(?:\s+(?:played\s+)?in\s+(\d{4}))?(?:\s+(?:at|in|played\s+at)\s+(.+))?/i;
     const matchListMatch = state.question.match(matchListPattern);
     if (matchListMatch) {
       const rawFormat = matchListMatch[1].toUpperCase();
-      // team_matches stores Test as "TEST", T20 as "T20I"
-      const format = rawFormat === 'T20' ? 'T20I' : rawFormat; // TEST stays TEST, ODI stays ODI
+      const format = rawFormat === 'T20' ? 'T20I' : rawFormat;
       const year = matchListMatch[2] ? parseInt(matchListMatch[2], 10) : null;
       const venue = matchListMatch[3]?.trim().replace(/[?!.]+$/, '') ?? null;
 
@@ -381,10 +377,6 @@ const schemaPath = join(__dirname, '..', '..', 'cricket data', 'schema-descripti
     }
 
     // ── Matches at a venue with margin condition ──────────────────────────────
-    // e.g. "matches at Sharjah where the margin was greater than 100 runs"
-    //      "matches in Dubai with margin > 50 runs"
-    // NOTE: margin is stored as a string like "150 runs" or "6 wickets"
-    //       so we use an aggregation pipeline to extract the numeric part.
     const venueMarginPattern =
       /matches?\s+(?:played\s+)?(?:at|in)\s+([A-Za-z ()]+?)\s+(?:where|with|when)\s+.*?margin\s+(?:was\s+)?(?:greater\s+than|more\s+than|over|above|>)\s+(\d+)\s+runs?/i;
     const venueMarginMatch = state.question.match(venueMarginPattern);
@@ -423,7 +415,6 @@ const schemaPath = join(__dirname, '..', '..', 'cricket data', 'schema-descripti
     }
 
     // ── Matches at a venue ────────────────────────────────────────────────────
-    // Stop capture at "where", "with", "when", "and" to avoid swallowing conditions
     const venuePattern = /matches?\s+(?:played\s+)?(?:at|in)\s+([A-Za-z ()]+?)(?:\s+(?:where|with|when|and|in\s+\d{4})|[?!.]|$)/i;
     const venueMatch = state.question.match(venuePattern);
     if (venueMatch) {
@@ -439,8 +430,7 @@ const schemaPath = join(__dirname, '..', '..', 'cricket data', 'schema-descripti
       return;
     }
 
-    // ── Win after bowling first (toss won + batted 2nd + won) ────────────────
-    // e.g. "How many times did a team win after choosing to bowl first?"
+    // ── Win after bowling first ───────────────────────────────────────────────
     const bowlFirstWinPattern =
       /(?:how\s+many\s+times?|count|number\s+of\s+times?)\s+.*(?:win|won|winning)\s+.*(?:bowl(?:ing)?\s+first|chose?\s+to\s+bowl|elect(?:ed)?\s+to\s+bowl)/i;
     const bowlFirstWinPattern2 =
@@ -474,14 +464,47 @@ const schemaPath = join(__dirname, '..', '..', 'cricket data', 'schema-descripti
       return;
     }
 
+    // ── "ODI/Test/T20I [team] played with/against [team] in [year]" ───────────
+    const teamPlayedWithPattern =
+      /^(odi|t20i?|test)s?\s+([A-Za-z ]{2,30}?)\s+(?:played\s+(?:with|against)|vs\.?|versus|against)\s+([A-Za-z ]{2,30}?)(?:\s+in\s+(\d{4}))?[?!.]*$/i;
+    const tpwMatch = state.question.match(teamPlayedWithPattern);
+    if (tpwMatch) {
+      const fmtRaw = tpwMatch[1].toUpperCase();
+      const fmt = fmtRaw === 'T20' ? 'T20I' : fmtRaw;
+      const team1 = tpwMatch[2].trim();
+      const team2 = tpwMatch[3].trim();
+      const year = tpwMatch[4] ? parseInt(tpwMatch[4], 10) : null;
+      console.log(`=== RULE-BASED: format+team played with team — "${team1}" vs "${team2}" format=${fmt} year=${year} ===`);
+      const andConditions: any[] = [
+        {
+          $or: [
+            { team: { $regex: team1, $options: 'i' }, opponent: { $regex: team2, $options: 'i' } },
+            { team: { $regex: team2, $options: 'i' }, opponent: { $regex: team1, $options: 'i' } },
+          ],
+        },
+        { format: fmt },
+      ];
+      if (year) {
+        // date is stored as ISO string "YYYY-MM-DD", so filter by string prefix
+        andConditions.push({ date: { $regex: `^${year}-`, $options: 'i' } });
+      }
+      state.generatedQuery = {
+        collection: 'team_matches',
+        pipeline: [
+          { $match: { $and: andConditions } },
+          { $sort: { date: -1 } },
+          { $limit: 20 },
+        ],
+      };
+      return;
+    }
+
     // ── Team vs Team ──────────────────────────────────────────────────────────
-    // Only match if both sides look like team names (no generic words like "bowl", "bat", "win")
     const vsPattern = /^(?:find|show|list|get|display)?\s*(?:all\s+)?(?:matches?\s+(?:where|between)\s+)?([A-Za-z ]{2,30}?)\s+(?:vs\.?|versus|against)\s+([A-Za-z ]{2,30}?)(?:\s*[?!.]*)$/i;
     const vsMatch = state.question.match(vsPattern);
     if (vsMatch) {
       const team1 = vsMatch[1].trim();
       const team2 = vsMatch[2].trim();
-      // Skip if either side contains non-team words
       const nonTeamWords = /\b(?:bowl|bat|win|won|toss|first|second|1st|2nd|how|many|times?|count)\b/i;
       if (!nonTeamWords.test(team1) && !nonTeamWords.test(team2)) {
         console.log(`=== RULE-BASED: team vs team — "${team1}" vs "${team2}" ===`);
@@ -507,8 +530,6 @@ const schemaPath = join(__dirname, '..', '..', 'cricket data', 'schema-descripti
     }
 
     // ── Player match-by-match performance against a specific opponent ─────────
-    // e.g. "How did Babar Azam perform against India?"
-    //      "Virat Kohli stats vs Australia in T20Is"
     const playerVsOpponentPattern =
       /(?:how\s+did\s+|performance\s+of\s+|stats?\s+(?:of\s+)?)?([A-Za-z .'-]{3,35}?)\s+(?:perform(?:ance)?|stats?|record|figures?)?\s*(?:against|vs\.?|versus)\s+([A-Za-z ]{3,30}?)(?:\s+in\s+(odi|t20i?|test))?[?!.]*$/i;
     const pvoMatch = state.question.match(playerVsOpponentPattern);
@@ -519,22 +540,22 @@ const schemaPath = join(__dirname, '..', '..', 'cricket data', 'schema-descripti
       const fmt = fmtRaw
         ? fmtRaw.toUpperCase() === 'T20' ? 'T20I' : fmtRaw.charAt(0).toUpperCase() + fmtRaw.slice(1).toLowerCase()
         : null;
-      const genericWords4 = /^(?:a|the|this|that|team|player|match|game|cricket|all|any|every|which|what|who|how|when|where|why|india|pakistan|australia|england|newzealand|srilanka|bangladesh|westindies|southafrica|zimbabwe|afghanistan|ireland)$/i;
-      if (!genericWords4.test(playerName) && playerName.length >= 3) {
+      const genericOpponents = /^(?:a|the|this|that|team|player|match|game|cricket|all|any|every|which|what|who|how|when|where|why|india|pakistan|australia|england|newzealand|srilanka|bangladesh|westindies|southafrica|zimbabwe|afghanistan|ireland)$/i;
+      const startsWithFormat = /^(odi|t20i?|test)\b/i;
+      if (isValidPlayerName(playerName) && !genericOpponents.test(playerName) && !startsWithFormat.test(playerName)) {
         console.log(`=== RULE-BASED: player "${playerName}" vs opponent "${opponent}" format=${fmt} ===`);
         state.generatedQuery = {
           collection: 'players_matches',
           _playerNameLookup: playerName,
           _opponent: opponent,
           _format: fmt,
-          pipeline: [{ $match: { player_id: -1 } }], // placeholder
+          pipeline: [{ $match: { player_id: -1 } }],
         };
         return;
       }
     }
 
     // ── Toss win → match win correlation ─────────────────────────────────────
-    // e.g. "How many times did the toss winner also win the match?"
     const tossWinMatchWinPattern =
       /(?:how\s+many\s+times?|count|number\s+of\s+times?).*toss.*(?:win|won).*(?:match|game).*(?:win|won)|toss\s+winner.*(?:win|won)|(?:win|won).*toss.*(?:win|won)\s+(?:the\s+)?match/i;
     if (tossWinMatchWinPattern.test(state.question)) {
@@ -550,7 +571,6 @@ const schemaPath = join(__dirname, '..', '..', 'cricket data', 'schema-descripti
     }
 
     // ── Highest team score ────────────────────────────────────────────────────
-    // e.g. "What is the highest team score in ODIs?", "Highest score ever in T20Is"
     const highestScorePattern =
       /(?:highest|biggest|maximum|largest)\s+(?:team\s+)?(?:score|total|innings)(?:\s+(?:in|ever|recorded))?(?:\s+in\s+(odi|t20i?|test))?/i;
     const hsMatch = state.question.match(highestScorePattern);
@@ -572,7 +592,6 @@ const schemaPath = join(__dirname, '..', '..', 'cricket data', 'schema-descripti
     }
 
     // ── Matches won by a specific team ────────────────────────────────────────
-    // e.g. "How many ODIs has India won?", "Pakistan wins in T20Is"
     const teamWinsPattern =
       /(?:how\s+many\s+(?:odi|t20i?|test)s?\s+(?:has|have|did)\s+([A-Za-z ]{3,25}?)\s+won?|([A-Za-z ]{3,25}?)\s+(?:odi|t20i?|test)\s+wins?)/i;
     const twMatch = state.question.match(teamWinsPattern);
@@ -580,8 +599,7 @@ const schemaPath = join(__dirname, '..', '..', 'cricket data', 'schema-descripti
       const teamName = (twMatch[1] ?? twMatch[2])?.trim().replace(/[?!.]+$/, '');
       const fmtM = state.question.match(/\b(odi|t20i?|test)\b/i);
       const fmt = fmtM ? (fmtM[1].toUpperCase() === 'T20' ? 'T20I' : fmtM[1].toUpperCase()) : null;
-      const genericWords5 = /^(?:a|the|this|that|team|player|match|game|cricket|all|any|every)$/i;
-      if (teamName && !genericWords5.test(teamName) && teamName.length >= 3) {
+      if (teamName && isValidPlayerName(teamName)) {
         const matchStage: any = { team: { $regex: teamName, $options: 'i' }, result: 'won' };
         if (fmt) matchStage.format = fmt;
         console.log(`=== RULE-BASED: wins for team "${teamName}" format=${fmt} ===`);
@@ -596,8 +614,34 @@ const schemaPath = join(__dirname, '..', '..', 'cricket data', 'schema-descripti
       }
     }
 
+    // ── Total / how many players (in a year / format) ────────────────────────
+    const totalPlayersPattern =
+      /(?:total|how\s+many|number\s+of|count\s+of?)\s+(?:unique\s+)?players?(?:\s+(?:in|during|for|played\s+in)\s+(\d{4}))?(?:\s+in\s+(odi|t20i?|test))?/i;
+    const totalPlayersMatch = state.question.match(totalPlayersPattern);
+    if (totalPlayersMatch) {
+      const year = totalPlayersMatch[1] ? parseInt(totalPlayersMatch[1], 10) : null;
+      const fmtRaw = totalPlayersMatch[2] ?? state.question.match(/\b(odi|t20i?|test)\b/i)?.[1];
+      const fmt = fmtRaw
+        ? fmtRaw.toUpperCase() === 'T20' ? 'T20I' : fmtRaw.charAt(0).toUpperCase() + fmtRaw.slice(1).toLowerCase()
+        : null;
+
+      const matchStage: any = {};
+      if (year) matchStage.year = year;
+      if (fmt) matchStage.format = fmt;
+
+      console.log(`=== RULE-BASED: total players year=${year} format=${fmt} ===`);
+      state.generatedQuery = {
+        collection: 'players_yearly',
+        pipeline: [
+          ...(Object.keys(matchStage).length > 0 ? [{ $match: matchStage }] : []),
+          { $group: { _id: '$player_id' } },
+          { $count: 'total_players' },
+        ],
+      };
+      return;
+    }
+
     // ── Most centuries / fifties by a player ─────────────────────────────────
-    // e.g. "Who has scored the most centuries in ODIs?"
     const mostCenturiesPattern = /(?:most|highest|top)\s+(?:\d+\s+)?(?:centur(?:ies|y)|hundreds?)\s+(?:in\s+)?(odi|t20i?|test)?/i;
     const mostFiftiesPattern = /(?:most|highest|top)\s+(?:\d+\s+)?(?:fifties|half.?centur(?:ies|y))\s+(?:in\s+)?(odi|t20i?|test)?/i;
 
@@ -622,7 +666,6 @@ const schemaPath = join(__dirname, '..', '..', 'cricket data', 'schema-descripti
     }
 
     if (mostFiftiesPattern.test(state.question)) {
-      // fifties are in players_matches, not players_yearly
       const fmtM = state.question.match(/\b(odi|t20i?|test)\b/i);
       const fmt = fmtM ? (fmtM[1].toUpperCase() === 'T20' ? 'T20I' : fmtM[1].charAt(0).toUpperCase() + fmtM[1].slice(1).toLowerCase()) : null;
       const limitM = state.question.match(/\btop\s+(\d+)\b/i);
@@ -712,12 +755,10 @@ EXAMPLES:
 Question: "${state.question}"`;
 
     try {
-      // Use the best available model — falls back automatically on 429
       const response = await this.callAI(userPrompt, GROQ_MODEL_CHAIN[0], systemPrompt);
       console.log('=== RAW QUERY RESPONSE ===');
       console.log(response);
 
-      // Strip markdown code fences if present
       const stripped = response
         .replace(/```(?:json)?\s*/gi, '')
         .replace(/```/g, '')
@@ -752,13 +793,19 @@ Question: "${state.question}"`;
     try {
       const db = this.databaseService.getDb();
 
-      // ── Two-step player name → stats lookup ──────────────────────────────
-      // When tryRuleBasedQuery sets _playerNameLookup, we first resolve the
-      // player_id from the players collection, then query the target collection.
       if (state.generatedQuery._playerNameLookup) {
         const playerName = state.generatedQuery._playerNameLookup;
         const format = state.generatedQuery._format;
         const opponent = state.generatedQuery._opponent;
+
+        // Safety check — if the name is generic/invalid, bail out early with a helpful message
+        const INVALID_PLAYER_PHRASES = /^(total|how many|number of|count|all|every|any|list|show|find|get|display)\b/i;
+        if (!isValidPlayerName(playerName) || INVALID_PLAYER_PHRASES.test(playerName)) {
+          state.formattedAnswer = `I wasn't able to identify a specific player name in your question. Please mention a player by name, for example: "What are Virat Kohli's ODI stats?"`;
+          state.answerType = 'text';
+          state.queryResults = [];
+          return;
+        }
 
         const playerDoc = await db.collection('players').findOne({
           $or: [
@@ -768,7 +815,7 @@ Question: "${state.question}"`;
         });
 
         if (!playerDoc) {
-          state.formattedAnswer = `No player named "${playerName}" was found in the dataset. Please check the spelling or try a different name.`;
+          state.formattedAnswer = `No player named "${playerName}" was found in the dataset. The dataset covers international cricketers tracked by ESPN Cricinfo. Please check the spelling or try a different name.`;
           state.answerType = 'text';
           state.queryResults = [];
           return;
@@ -776,7 +823,6 @@ Question: "${state.question}"`;
 
         const playerId = playerDoc.player_id;
 
-        // ── Player vs opponent (players_matches) ──────────────────────────
         if (opponent) {
           const matchStage: any = {
             player_id: playerId,
@@ -803,7 +849,6 @@ Question: "${state.question}"`;
           return;
         }
 
-        // ── Player career stats (players_yearly) ──────────────────────────
         const matchStage: any = { player_id: playerId };
         if (format) matchStage.format = format;
 
@@ -813,7 +858,6 @@ Question: "${state.question}"`;
           .sort({ year: -1 })
           .toArray();
 
-        // Attach player name to each row
         for (const row of state.queryResults) {
           row.player_name = playerDoc.full_name || playerDoc.short_name;
           row.player_country = playerDoc.country;
@@ -826,7 +870,6 @@ Question: "${state.question}"`;
         return;
       }
 
-      // Normalize the query before execution to fix common AI mistakes
       this.normalizeQuery(state.generatedQuery);
 
       const {
@@ -845,7 +888,7 @@ Question: "${state.question}"`;
 
       if (totalDocs === 0) {
         console.warn(`⚠️  Collection "${collectionName}" is empty — data may not be imported yet.`);
-        state.formattedAnswer = `The "${collectionName}" collection has no data. Please run the data import script first: \`node backend/import.js\``;
+        state.formattedAnswer = `The "${collectionName}" collection has no data. Please run the data import script first.`;
         state.answerType = 'text';
         state.queryResults = [];
         return;
@@ -864,7 +907,6 @@ Question: "${state.question}"`;
 
       console.log('Query returned', state.queryResults.length, 'results');
 
-      // Skip name enrichment when querying players directly — names already present
       if (collectionName !== 'players') {
         await this.enrichWithPlayerNames(state);
       }
@@ -877,12 +919,9 @@ Question: "${state.question}"`;
 
   // ─────────────────────────────────────────────────────────────────────────────
   // HELPER: NORMALIZE VENUE NAME
-  // Venues in DB are short names: "Lords", "The Oval", "Melbourne", "Sharjah"
-  // The AI often generates full formal names — strip them down to the key word.
   // ─────────────────────────────────────────────────────────────────────────────
 
   private normalizeVenueName(venue: string): string {
-    // Known alias map: formal/common name → DB value (or key search term)
     const ALIAS_MAP: Record<string, string> = {
       "lord's":           'Lords',
       "lords cricket ground": 'Lords',
@@ -930,7 +969,6 @@ Question: "${state.question}"`;
     const lower = venue.toLowerCase().trim();
     if (ALIAS_MAP[lower]) return ALIAS_MAP[lower];
 
-    // Strip common suffixes to get the core name
     const stripped = venue
       .replace(/\s+(cricket\s+)?(ground|stadium|oval|park|arena|field|centre|center)$/i, '')
       .replace(/\s+(international|national|association)$/i, '')
@@ -940,14 +978,13 @@ Question: "${state.question}"`;
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
-  // HELPER: NORMALIZE QUERY — fix common AI field-value mistakes
+  // HELPER: NORMALIZE QUERY
   // ─────────────────────────────────────────────────────────────────────────────
 
   private normalizeQuery(query: any): void {
     if (!query) return;
     const col = query.collection;
 
-    // Fix format casing: team_matches uses "TEST", players_* use "Test"
     const fixFormat = (obj: any) => {
       if (!obj || typeof obj !== 'object') return;
       if (obj.format !== undefined) {
@@ -969,7 +1006,6 @@ Question: "${state.question}"`;
       }
     };
 
-    // Fix result casing for team_matches (must be lowercase)
     const fixResult = (obj: any) => {
       if (!obj || typeof obj !== 'object') return;
       if (obj.result !== undefined && col === 'team_matches') {
@@ -983,7 +1019,6 @@ Question: "${state.question}"`;
       }
     };
 
-    // Fix venue names — AI often generates full formal names, DB has short names
     const fixVenue = (obj: any) => {
       if (!obj || typeof obj !== 'object') return;
       if (obj.venue !== undefined && typeof obj.venue === 'string') {
@@ -1026,7 +1061,6 @@ Question: "${state.question}"`;
 
     const playerIds = new Set<number>();
     for (const row of state.queryResults) {
-      // player_id field, or _id when it's a $group result grouped by player_id
       const id = row.player_id ?? (typeof row._id === 'number' ? row._id : undefined);
       if (id !== undefined && id !== null && !isNaN(Number(id))) {
         playerIds.add(Number(id));
@@ -1073,16 +1107,13 @@ Question: "${state.question}"`;
       return;
     }
 
-    // Player profile → key-value table
     if (state.generatedQuery?.collection === 'players') {
       state.formattedAnswer = this.buildPlayerProfileTable(state.queryResults);
       state.answerType = 'table';
       return;
     }
 
-    // Player yearly stats from two-step lookup → career stats table
     if (state.generatedQuery?._playerNameLookup !== undefined && state.queryResults.length > 0) {
-      // If it's a vs-opponent query, show match-by-match table
       if (state.generatedQuery?._opponent) {
         state.formattedAnswer = this.buildPlayerMatchTable(state.queryResults, state.question);
       } else {
@@ -1092,7 +1123,6 @@ Question: "${state.question}"`;
       return;
     }
 
-    // $count pipeline result — single doc with one numeric key
     if (
       state.queryResults.length === 1 &&
       state.generatedQuery?.pipeline
@@ -1108,7 +1138,6 @@ Question: "${state.question}"`;
       }
     }
 
-    // Win/loss record pipeline result (grouped by result field)
     if (
       state.generatedQuery?.pipeline &&
       state.queryResults.length > 0 &&
@@ -1129,7 +1158,6 @@ Question: "${state.question}"`;
       state.formattedAnswer = this.buildMarkdownTable(state.queryResults, state.question);
       state.answerType = 'table';
     } else {
-      // Single result — use the smallest model to write one sentence (saves tokens)
       const resultsJson = JSON.stringify(state.queryResults, null, 2);
       const prompt = `Write a single concise sentence answering this cricket question using the data provided.
 
@@ -1145,12 +1173,10 @@ Rules:
 Answer:`;
 
       try {
-        // Use smallest model for single-sentence answers — cheapest on tokens
         const response = await this.callAI(prompt, 'llama-3.1-8b-instant');
         state.formattedAnswer = response.trim();
         state.answerType = 'text';
       } catch {
-        // Fallback: show as table anyway
         state.formattedAnswer = this.buildMarkdownTable(state.queryResults, state.question);
         state.answerType = 'table';
       }
@@ -1181,7 +1207,6 @@ Answer:`;
 
   // ─────────────────────────────────────────────────────────────────────────────
   // HELPER: BUILD PLAYER CAREER STATS TABLE
-  // Shows year-by-year stats for a player from players_yearly collection
   // ─────────────────────────────────────────────────────────────────────────────
 
   private buildPlayerStatsTable(results: any[], question: string): string {
@@ -1197,7 +1222,6 @@ Answer:`;
     const lines: string[] = [];
     lines.push(`**${playerName}${country} — Career Statistics**\n`);
 
-    // Determine which columns to show
     const showBatting = !isBowlingQ || isBattingQ || (!isBowlingQ && !isBattingQ);
     const showBowling = isBowlingQ || (!isBowlingQ && !isBattingQ);
 
@@ -1209,7 +1233,6 @@ Answer:`;
     lines.push(`| ${headers.join(' | ')} |`);
     lines.push(`| ${headers.map(() => '---').join(' | ')} |`);
 
-    // Aggregate totals
     let totalRuns = 0, totalWkts = 0, totalMatches = 0, totalHundreds = 0;
 
     for (const r of results) {
@@ -1224,7 +1247,7 @@ Answer:`;
           r.highest_score || '-',
           r.average !== '' && r.average !== undefined ? String(r.average) : '-',
           r.hundreds !== '' && r.hundreds !== undefined ? String(r.hundreds) : '-',
-          '-', // fifties not in players_yearly
+          '-',
         );
         if (typeof r.runs === 'number') totalRuns += r.runs;
         if (typeof r.hundreds === 'number') totalHundreds += r.hundreds;
@@ -1246,7 +1269,6 @@ Answer:`;
       lines.push(`| ${row.join(' | ')} |`);
     }
 
-    // Summary line
     const summaryParts: string[] = [`Total matches: **${totalMatches}**`];
     if (showBatting && totalRuns > 0) summaryParts.push(`runs: **${totalRuns}**`, `centuries: **${totalHundreds}**`);
     if (showBowling && totalWkts > 0) summaryParts.push(`wickets: **${totalWkts}**`);
@@ -1256,7 +1278,7 @@ Answer:`;
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
-  // HELPER: BUILD PLAYER MATCH-BY-MATCH TABLE (vs opponent)
+  // HELPER: BUILD PLAYER MATCH-BY-MATCH TABLE
   // ─────────────────────────────────────────────────────────────────────────────
 
   private buildPlayerMatchTable(results: any[], question: string): string {
@@ -1333,12 +1355,10 @@ Answer:`;
     type ColDef = { key: string; label: string; transform?: (v: any, row: any, i: number) => string };
     const cols: ColDef[] = [];
 
-    // Rank — use map index (i) for O(1) performance
     cols.push({ key: '__rank', label: '#', transform: (_, _row, i) => String(i + 1) });
 
     const first = results[0];
 
-    // ── Team match result columns ─────────────────────────────────────────────
     if (isTeamMatch) {
       if (first?.team !== undefined) cols.push({ key: 'team', label: 'Team' });
       if (first?.opponent !== undefined) cols.push({ key: 'opponent', label: 'Opponent' });
@@ -1353,23 +1373,18 @@ Answer:`;
       if (first?.toss !== undefined) cols.push({ key: 'toss', label: 'Toss' });
       if (first?.batting !== undefined) cols.push({ key: 'batting', label: 'Bat' });
     } else {
-      // ── Player / aggregation columns ────────────────────────────────────────
-
-      // Player name / ID
       if (first?.player_name !== undefined) {
         cols.push({ key: 'player_name', label: 'Player' });
       } else if (first?.player_id !== undefined) {
         cols.push({ key: 'player_id', label: 'Player ID' });
       }
 
-      // Country / team
       if (first?.player_country !== undefined) {
         cols.push({ key: 'player_country', label: 'Country' });
       } else if (first?.team !== undefined) {
         cols.push({ key: 'team', label: 'Team' });
       }
 
-      // Aggregation stat columns
       if (first?.total_runs !== undefined) cols.push({ key: 'total_runs', label: 'Runs' });
       if (first?.total_wickets !== undefined) cols.push({ key: 'total_wickets', label: 'Wickets' });
       if (first?.total_hundreds !== undefined) cols.push({ key: 'total_hundreds', label: 'Centuries' });
@@ -1393,7 +1408,6 @@ Answer:`;
       if (first?.result !== undefined && results.length <= 5) cols.push({ key: 'result', label: 'Result' });
     }
 
-    // Fallback: show all scalar fields if almost no stat columns were added
     const existingKeys = new Set(cols.map(c => c.key));
     if (cols.length <= 2) {
       const SKIP_KEYS = new Set(['_id', 'player_id', 'player_name', 'player_country', 'team', '__rank']);
@@ -1458,12 +1472,6 @@ Answer:`;
 
   // ─────────────────────────────────────────────────────────────────────────────
   // CORE: CALL GROQ AI WITH MODEL FALLBACK CHAIN
-  //
-  // Strategy:
-  //   1. Try the requested model first.
-  //   2. On 429 (rate limit) or 503 (unavailable), try the next model in the chain.
-  //   3. Each model gets up to `maxRetriesPerModel` attempts with exponential back-off.
-  //   4. Throw only after all models are exhausted.
   // ─────────────────────────────────────────────────────────────────────────────
 
   private async callAI(
@@ -1477,7 +1485,6 @@ Answer:`;
       throw new Error('GROQ_API_KEY is missing from .env file');
     }
 
-    // Build the model chain: preferred model first, then the rest (no duplicates)
     const modelChain = [
       preferredModel,
       ...GROQ_MODEL_CHAIN.filter(m => m !== preferredModel),
@@ -1529,27 +1536,23 @@ Answer:`;
 
           if (isRateLimit || isUnavailable) {
             if (attempt < maxRetriesPerModel) {
-              // Respect Retry-After header if present, else exponential back-off
               const retryAfter = error.response?.headers?.['retry-after'];
               const waitMs = retryAfter
                 ? Math.min(Number(retryAfter) * 1000, 15_000)
                 : Math.min(1000 * 2 ** attempt, 10_000);
               console.log(`  → waiting ${waitMs}ms before retry…`);
               await new Promise(r => setTimeout(r, waitMs));
-              continue; // retry same model
+              continue;
             }
-            // Out of retries for this model — try next model in chain
             console.warn(`  → model "${model}" exhausted, trying next model in chain…`);
             break;
           }
 
-          // Non-retryable error (4xx other than 429) — fail immediately
           throw error;
         }
       }
     }
 
-    // All models in the chain failed
     console.error('=== ALL GROQ MODELS EXHAUSTED ===');
     throw lastError;
   }

@@ -1,9 +1,20 @@
+import { useEffect, useState } from 'react';
 import ChatInterface from '@/components/ChatInterface';
 import styles from '@/styles/Home.module.css';
 import { useTheme } from '@/context/ThemeContext';
 
 export default function Home() {
   const { theme, toggleTheme } = useTheme();
+  const [mounted, setMounted] = useState(false);
+
+  useEffect(() => {
+    setMounted(true);
+  }, []);
+
+  // Before mount, render theme-neutral placeholders so SSR and first client
+  // render produce identical HTML — no hydration mismatch.
+  const themeLabel = mounted ? `Switch to ${theme === 'dark' ? 'light' : 'dark'} mode` : 'Toggle theme';
+  const themeIcon  = mounted ? (theme === 'dark' ? '☀️' : '🌙') : '☀️';
 
   return (
     <div className={styles.container}>
@@ -20,10 +31,11 @@ export default function Home() {
             <button
               className={styles.themeToggle}
               onClick={toggleTheme}
-              title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`}
-              aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`}
+              title={themeLabel}
+              aria-label={themeLabel}
+              suppressHydrationWarning
             >
-              {theme === 'dark' ? '☀️' : '🌙'}
+              {themeIcon}
             </button>
           </div>
         </div>
