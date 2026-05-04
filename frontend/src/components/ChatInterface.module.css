@@ -1,6 +1,16 @@
 /* ═══════════════════════════════════════════════════════════
    LAYOUT
 ═══════════════════════════════════════════════════════════ */
+
+/* Outer wrapper — holds history panel + chat side by side */
+.chatWrapper {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  position: relative;
+}
+
 .chatContainer {
   display: flex;
   flex-direction: column;
@@ -312,6 +322,24 @@
   border: 1px solid var(--border);
 }
 
+.tableTitle {
+  padding: 0.75rem 1.1rem 0.5rem;
+  font-size: 0.85rem;
+  font-weight: 700;
+  color: var(--accent);
+  background: linear-gradient(135deg, var(--midnight-950), var(--midnight-700));
+  border-bottom: 1px solid var(--border);
+  letter-spacing: 0.2px;
+}
+
+.tableFooter {
+  padding: 0.6rem 1.1rem;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  background: var(--midnight-900);
+  border-top: 1px solid var(--border-soft);
+}
+
 .table {
   width: 100%;
   border-collapse: collapse;
@@ -395,6 +423,8 @@
   background: var(--midnight-800);
   border-top: 1px solid var(--border);
   padding: 1rem 2rem 1.25rem;
+  /* iOS safe area — home bar */
+  padding-bottom: max(1.25rem, env(safe-area-inset-bottom));
 }
 
 .inputHint {
@@ -404,6 +434,8 @@
   display: flex;
   align-items: center;
   gap: 0.4rem;
+  flex-wrap: wrap;
+  row-gap: 0.3rem;
 }
 
 .clearBtn {
@@ -431,6 +463,11 @@
   border-radius: 50%;
   background: var(--accent);
   animation: blink 2s ease infinite;
+  flex-shrink: 0;
+}
+
+.inputHintText {
+  /* visible by default; hidden on small screens via media query */
 }
 
 @keyframes blink {
@@ -831,11 +868,21 @@
 
   .inputArea {
     padding: 0.65rem 0.85rem 0.85rem;
+    padding-bottom: max(0.85rem, env(safe-area-inset-bottom));
   }
 
   .inputHint {
     font-size: 0.67rem;
     margin-bottom: 0.45rem;
+  }
+
+  /* Hide keyboard shortcut hint text on small screens — keep only buttons */
+  .inputHintText {
+    display: none;
+  }
+
+  .inputHintDot {
+    display: none;
   }
 
   .inputForm {
@@ -921,10 +968,330 @@
 }
 
 /* ═══════════════════════════════════════════════════════════
+   RESPONSIVE — EXTRA LARGE SCREENS (≥ 1400px)
+═══════════════════════════════════════════════════════════ */
+@media (min-width: 1400px) {
+  .messagesContainer {
+    padding: 2.5rem 5rem;
+  }
+
+  .inputArea {
+    padding: 1.25rem 4.5rem 1.75rem;
+  }
+
+  .bubbleWrapper {
+    max-width: 62%;
+  }
+
+  .suggestedQuestions {
+    max-width: 820px;
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════
    TOUCH DEVICES — remove hover-only copy button
 ═══════════════════════════════════════════════════════════ */
 @media (hover: none) {
   .copyBtn {
     opacity: 1;
   }
+}
+
+/* ═══════════════════════════════════════════════════════════
+   MEMORY BADGE (on assistant messages)
+═══════════════════════════════════════════════════════════ */
+.memoryBadge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2rem;
+  padding: 0.1rem 0.45rem;
+  background: rgba(188, 140, 255, 0.12);
+  border: 1px solid rgba(188, 140, 255, 0.3);
+  border-radius: 999px;
+  font-size: 0.62rem;
+  font-weight: 600;
+  color: var(--purple);
+  letter-spacing: 0.3px;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   INPUT HINT ACTIONS (memory + clear buttons)
+═══════════════════════════════════════════════════════════ */
+.inputHintActions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.historyToggleBtn {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.18rem 0.55rem;
+  font-size: 0.68rem;
+  color: var(--purple);
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+  white-space: nowrap;
+}
+
+.historyToggleBtn:hover {
+  border-color: var(--purple);
+  background: rgba(188, 140, 255, 0.08);
+}
+
+/* ═══════════════════════════════════════════════════════════
+   HISTORY / MEMORY PANEL
+═══════════════════════════════════════════════════════════ */
+.historyPanel {
+  width: 0;
+  min-width: 0;
+  overflow: hidden;
+  background: var(--midnight-900);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  transition: width 0.3s cubic-bezier(0.4, 0, 0.2, 1),
+              min-width 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  flex-shrink: 0;
+}
+
+.historyPanelOpen {
+  width: 320px;
+  min-width: 280px;
+}
+
+.historyHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 1rem 1.25rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.historyHeaderActions {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.clearMemoryBtn {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.18rem 0.55rem;
+  font-size: 0.65rem;
+  color: #f85149;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+  white-space: nowrap;
+}
+
+.clearMemoryBtn:hover:not(:disabled) {
+  border-color: #f85149;
+  background: rgba(248, 81, 73, 0.08);
+}
+
+.clearMemoryBtn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.historyTitle {
+  font-size: 0.85rem;
+  font-weight: 700;
+  color: var(--text-primary);
+  white-space: nowrap;
+}
+
+.historyCloseBtn {
+  background: none;
+  border: none;
+  color: var(--text-faint);
+  cursor: pointer;
+  font-size: 0.85rem;
+  padding: 0.2rem 0.4rem;
+  border-radius: 4px;
+  transition: color 0.15s, background 0.15s;
+  flex-shrink: 0;
+}
+
+.historyCloseBtn:hover {
+  color: var(--text-primary);
+  background: var(--midnight-700);
+}
+
+.historyLoading {
+  display: flex;
+  justify-content: center;
+  padding: 2rem;
+}
+
+/* Memory summary box */
+.summaryBox {
+  margin: 0.75rem 1rem;
+  padding: 0.75rem 1rem;
+  background: rgba(188, 140, 255, 0.07);
+  border: 1px solid rgba(188, 140, 255, 0.2);
+  border-radius: 10px;
+  flex-shrink: 0;
+}
+
+.summaryLabel {
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--purple);
+  margin-bottom: 0.4rem;
+}
+
+.summaryText {
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+
+/* History list */
+.historyList {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0.5rem 0.75rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.historyEmpty {
+  font-size: 0.8rem;
+  color: var(--text-faint);
+  text-align: center;
+  padding: 2rem 1rem;
+}
+
+.historyEntry {
+  background: var(--midnight-800);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.7rem 0.85rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  transition: border-color 0.15s;
+}
+
+.historyEntry:hover {
+  border-color: var(--accent);
+}
+
+.historyEntryTime {
+  font-size: 0.62rem;
+  color: var(--text-faint);
+}
+
+.historyEntryQ {
+  font-size: 0.78rem;
+  color: var(--text-primary);
+  font-weight: 600;
+  display: flex;
+  gap: 0.4rem;
+  align-items: flex-start;
+  line-height: 1.4;
+}
+
+.historyEntryA {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  display: flex;
+  gap: 0.4rem;
+  align-items: flex-start;
+  line-height: 1.4;
+}
+
+.historyQIcon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 4px;
+  background: var(--accent-dark);
+  color: white;
+  font-size: 0.6rem;
+  font-weight: 800;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+.historyAIcon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 4px;
+  background: var(--midnight-600);
+  color: var(--text-muted);
+  font-size: 0.6rem;
+  font-weight: 800;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+.reAskBtn {
+  align-self: flex-end;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.15rem 0.5rem;
+  font-size: 0.65rem;
+  color: var(--accent);
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+  margin-top: 0.1rem;
+}
+
+.reAskBtn:hover {
+  border-color: var(--accent);
+  background: rgba(63, 185, 80, 0.08);
+}
+
+/* ═══════════════════════════════════════════════════════════
+   RESPONSIVE — HISTORY PANEL ON MOBILE
+═══════════════════════════════════════════════════════════ */
+@media (max-width: 768px) {
+  .historyPanelOpen {
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    width: 85vw;
+    max-width: 320px;
+    z-index: 200;
+    box-shadow: var(--shadow-lg);
+  }
+}
+
+/* Overlay backdrop — shown when history panel is open on mobile */
+.historyOverlay {
+  display: none;
+}
+
+@media (max-width: 768px) {
+  .historyOverlay {
+    display: block;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.55);
+    z-index: 199;
+    animation: fadeIn 0.2s ease;
+  }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
 }

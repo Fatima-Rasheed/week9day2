@@ -9,6 +9,7 @@ async function bootstrap() {
     origin: [
       'http://localhost:3000',
       'https://week9day2frontend.vercel.app',
+      'https://week9day3frontend.vercel.app',
     ],
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],

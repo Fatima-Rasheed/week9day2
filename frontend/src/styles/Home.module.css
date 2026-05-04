@@ -3,10 +3,18 @@
   flex-direction: column;
   height: 100vh;
   height: 100dvh;
-  max-width: 1200px;
+  width: 100%;
+  max-width: 1400px;
   margin: 0 auto;
   background: var(--bg-card);
   box-shadow: var(--shadow-lg);
+}
+
+/* On very wide screens, let it breathe but stay readable */
+@media (min-width: 1400px) {
+  .container {
+    max-width: 1600px;
+  }
 }
 
 /* ── Header ─────────────────────────────────────────────── */

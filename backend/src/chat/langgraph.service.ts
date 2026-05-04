@@ -3,10 +3,37 @@ import { ConfigService } from '@nestjs/config';
 import { DatabaseService } from '../database/database.service';
 import axios from 'axios';
 
+// ─────────────────────────────────────────────────────────────────────────────
+// MEMORY TYPES
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface ConversationEntry {
+  userId: string;
+  question: string;
+  answer: string;
+  timestamp: Date;
+}
+
+export interface MemorySummary {
+  userId: string;
+  summary: string;
+  updatedAt: Date;
+  entryCount: number;
+}
+
+// How many conversation turns to keep before summarising
+const MEMORY_SUMMARISE_THRESHOLD = 5;
+
 interface WorkflowState {
   question: string;
+  userId: string;
   isRelevant?: boolean;
   relevancyReason?: string;
+  // Memory
+  conversationHistory?: ConversationEntry[];
+  memorySummary?: string;
+  enrichedQuestion?: string;
+  // Query
   generatedQuery?: any;
   queryResults?: any[];
   formattedAnswer?: string;
@@ -66,19 +93,77 @@ export class LangGraphService {
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
+  // PUBLIC: GET CONVERSATION HISTORY
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  async getHistory(userId: string): Promise<ConversationEntry[]> {
+    const db = this.databaseService.getDb();
+    return db
+      .collection('conversations')
+      .find({ userId })
+      .sort({ timestamp: -1 })
+      .limit(50)
+      .toArray() as unknown as ConversationEntry[];
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // PUBLIC: GET MEMORY SUMMARY
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  async getMemorySummary(userId: string): Promise<MemorySummary | null> {
+    const db = this.databaseService.getDb();
+    return db
+      .collection('summaries')
+      .findOne({ userId }) as unknown as MemorySummary | null;
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // PUBLIC: CLEAR MEMORY
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  async clearMemory(userId: string): Promise<{ deleted: number }> {
+    const db = this.databaseService.getDb();
+    const [convResult] = await Promise.all([
+      db.collection('conversations').deleteMany({ userId }),
+      db.collection('summaries').deleteOne({ userId }),
+    ]);
+    console.log(`=== MEMORY CLEARED for user ${userId}: ${convResult.deletedCount} conversations removed ===`);
+    return { deleted: convResult.deletedCount };
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
   // PUBLIC ENTRY POINT
   // ─────────────────────────────────────────────────────────────────────────────
 
-  async runWorkflow(question: string): Promise<{ answer: string; type: 'text' | 'table' }> {
-    const state: WorkflowState = { question };
+  async runWorkflow(
+    question: string,
+    userId = 'anonymous',
+  ): Promise<{ answer: string; type: 'text' | 'table'; memoryUsed: boolean }> {
+    const state: WorkflowState = { question, userId };
 
-    // Skip relevancy check — saves tokens on a cricket-only app
-    state.isRelevant = true;
+    // ── Node 1: Relevancy Checker ─────────────────────────────────────────────
+    await this.checkRelevancy(state);
+    if (!state.isRelevant) {
+      return {
+        answer: state.relevancyReason ?? 'I can only answer cricket-related questions.',
+        type: 'text',
+        memoryUsed: false,
+      };
+    }
 
-    // Try rule-based query first (no AI tokens needed for common patterns)
-    this.tryRuleBasedQuery(state);
+    // ── Node 2: Memory Retriever ──────────────────────────────────────────────
+    await this.retrieveMemory(state);
 
-    // Fall back to AI query generation if no rule matched
+    // ── Node 3: Query Generator (with memory context) ─────────────────────────
+    // For clear follow-up questions (pronouns, vague phrases, no explicit entity)
+    // skip rule-based entirely — the AI uses enrichedQuestion with full context.
+    // For all other questions, try rule-based first (fast, zero tokens).
+    const skipRuleBased = this.isFollowUpQuestion(state);
+    if (!skipRuleBased) {
+      this.tryRuleBasedQuery(state);
+    } else {
+      console.log(`=== FOLLOW-UP DETECTED: skipping rule-based, using AI with context ===`);
+    }
     if (!state.generatedQuery) {
       await this.generateQuery(state);
     }
@@ -87,26 +172,410 @@ export class LangGraphService {
       return {
         answer: `Sorry, I could not generate a query for that question. Error: ${state.error ?? 'unknown'}. Please try rephrasing.`,
         type: 'text',
+        memoryUsed: !!(state.memorySummary || state.conversationHistory?.length),
       };
     }
 
+    // ── Node 4: Query Executor ────────────────────────────────────────────────
     await this.executeQuery(state);
 
     if (state.error) {
-      return { answer: `Sorry, there was an error running the query: ${state.error}`, type: 'text' };
+      return {
+        answer: `Sorry, there was an error running the query: ${state.error}`,
+        type: 'text',
+        memoryUsed: !!(state.memorySummary || state.conversationHistory?.length),
+      };
     }
 
     // executeQuery may have set formattedAnswer directly (e.g. empty collection warning)
-    if (state.formattedAnswer) {
-      return { answer: state.formattedAnswer, type: state.answerType ?? 'text' };
+    if (!state.formattedAnswer) {
+      // ── Node 5: Answer Formatter ──────────────────────────────────────────
+      await this.formatAnswer(state);
     }
 
-    await this.formatAnswer(state);
+    // ── Node 6: Memory Saver ──────────────────────────────────────────────────
+    await this.saveMemory(state);
 
+    // ── Node 7: Final Response ────────────────────────────────────────────────
     return {
       answer: state.formattedAnswer ?? 'No results found.',
       type: state.answerType ?? 'text',
+      memoryUsed: !!(state.memorySummary || state.conversationHistory?.length),
     };
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // NODE 1: RELEVANCY CHECKER
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  private async checkRelevancy(state: WorkflowState): Promise<void> {
+    const q = state.question.toLowerCase().trim();
+
+    // Fast keyword check — if clearly cricket-related, skip AI call
+    const cricketKeywords = [
+      'cricket', 'odi', 't20', 'test match', 'wicket', 'batsman', 'bowler',
+      'innings', 'over', 'run', 'century', 'fifty', 'player', 'team', 'match',
+      'score', 'average', 'stats', 'record', 'icc', 'bcci', 'ecb', 'squad',
+      'captain', 'batting', 'bowling', 'fielding', 'stumping', 'catch',
+      'lbw', 'no ball', 'wide', 'boundary', 'six', 'four', 'duck',
+    ];
+
+    const hasCricketKeyword = cricketKeywords.some(kw => q.includes(kw));
+    if (hasCricketKeyword) {
+      state.isRelevant = true;
+      return;
+    }
+
+    // Contextual follow-up: short questions that reference prior context
+    const followUpPatterns = [
+      /^(and\s+)?(what\s+about|how\s+about|what\s+about\s+in)\s+/i,
+      /^(and\s+)?(in\s+)?(test|odi|t20i?)\s*(cricket)?[?!.]?$/i,
+      /^(same\s+for|compare\s+with|vs\.?|versus)\s+/i,
+      /^(who|what|how|when|where|which)\s+/i,
+    ];
+
+    const isFollowUp = followUpPatterns.some(p => p.test(q));
+    if (isFollowUp) {
+      state.isRelevant = true;
+      return;
+    }
+
+    // Clearly off-topic patterns
+    const offTopicPatterns = [
+      /\b(weather|stock|price|recipe|cook|movie|film|music|song|politic|election|war|covid|vaccine|crypto|bitcoin)\b/i,
+    ];
+
+    if (offTopicPatterns.some(p => p.test(q))) {
+      state.isRelevant = false;
+      state.relevancyReason =
+        "I'm a cricket statistics assistant. I can only answer questions about cricket players, matches, and records. Please ask me something cricket-related!";
+      return;
+    }
+
+    // Default: allow through (cricket-only app)
+    state.isRelevant = true;
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // NODE 2: MEMORY RETRIEVER
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  private async retrieveMemory(state: WorkflowState): Promise<void> {
+    try {
+      const db = this.databaseService.getDb();
+
+      // Fetch last 5 conversation turns for this user
+      const recentHistory = await db
+        .collection('conversations')
+        .find({ userId: state.userId })
+        .sort({ timestamp: -1 })
+        .limit(5)
+        .toArray() as unknown as ConversationEntry[];
+
+      state.conversationHistory = recentHistory.reverse(); // oldest first
+
+      // Fetch existing summary
+      const summaryDoc = await db
+        .collection('summaries')
+        .findOne({ userId: state.userId }) as unknown as MemorySummary | null;
+
+      if (summaryDoc?.summary) {
+        state.memorySummary = summaryDoc.summary;
+      }
+
+      // Build enriched question using memory context
+      if (state.conversationHistory.length > 0 || state.memorySummary) {
+        state.enrichedQuestion = this.buildEnrichedQuestion(state);
+        // Resolve pronouns in the raw question so rule-based path also benefits
+        this.resolvePronouns(state);
+      } else {
+        state.enrichedQuestion = state.question;
+      }
+
+      console.log(
+        `=== MEMORY: ${state.conversationHistory.length} recent turns, summary: ${!!state.memorySummary} ===`,
+      );
+    } catch (err) {
+      console.warn('Memory retrieval failed (non-fatal):', err.message);
+      state.enrichedQuestion = state.question;
+      state.conversationHistory = [];
+    }
+  }
+
+  /**
+   * Strips markdown table syntax from an answer so it can be used as plain-text
+   * context in follow-up question enrichment.
+   */
+  private stripTableToSummary(answer: string): string {
+    // If it doesn't look like a table, return as-is (truncated)
+    if (!answer.includes('|')) {
+      return answer.slice(0, 300);
+    }
+
+    // Extract the bold header line (e.g. "**Virat Kohli (India) — Career Statistics**")
+    const headerMatch = answer.match(/\*\*([^*]+)\*\*/);
+    const header = headerMatch ? headerMatch[1] : '';
+
+    // Extract column headers from the first table row
+    const lines = answer.split('\n').filter(l => l.trim());
+    const tableLines = lines.filter(l => l.trim().startsWith('|'));
+    if (tableLines.length === 0) return answer.slice(0, 300);
+
+    const colHeaders = tableLines[0]
+      .split('|')
+      .map(h => h.trim())
+      .filter(h => h && h !== '---');
+
+    // Extract data rows (skip header and separator rows)
+    const dataRows = tableLines
+      .slice(2) // skip header row and separator row
+      .slice(0, 5) // take at most 5 rows for context
+      .map(row =>
+        row
+          .split('|')
+          .map(c => c.trim())
+          .filter(c => c),
+      );
+
+    if (dataRows.length === 0) return header || answer.slice(0, 300);
+
+    // Build a compact plain-text summary
+    const rowSummaries = dataRows.map(cells =>
+      colHeaders
+        .map((col, i) => (cells[i] && cells[i] !== '-' ? `${col}: ${cells[i]}` : null))
+        .filter(Boolean)
+        .join(', '),
+    );
+
+    const summary = header
+      ? `${header} — ${rowSummaries.join(' | ')}`
+      : rowSummaries.join(' | ');
+
+    return summary.slice(0, 400);
+  }
+
+  /**
+   * Builds a context-enriched version of the question by appending recent
+   * conversation history so the query generator understands follow-up questions.
+   */
+  private buildEnrichedQuestion(state: WorkflowState): string {
+    const parts: string[] = [];
+
+    if (state.memorySummary) {
+      parts.push(`[Memory Summary: ${state.memorySummary}]`);
+    }
+
+    if (state.conversationHistory && state.conversationHistory.length > 0) {
+      const historyLines = state.conversationHistory
+        .map(e => `Q: ${e.question}\nA: ${this.stripTableToSummary(e.answer)}`)
+        .join('\n---\n');
+      parts.push(`[Recent conversation:\n${historyLines}\n]`);
+    }
+
+    parts.push(`Current question: ${state.question}`);
+    return parts.join('\n\n');
+  }
+
+  /**
+   * Resolves pronouns and vague references in state.question using conversation
+   * history, so the rule-based query path can identify the correct entity.
+   *
+   * Examples:
+   *   "what is his shirt number?"  → "what is Babar Azam shirt number?"
+   *   "how many ODI runs did he score?" → "how many ODI runs did Babar Azam score?"
+   *   "what about her bowling style?" → "what about [player] bowling style?"
+   *   "same for India?" → "same for India?"  (team already explicit, no change)
+   */
+  private resolvePronouns(state: WorkflowState): void {
+    const q = state.question;
+
+    // Only act if the question contains a pronoun/vague reference
+    const hasPronoun = /\b(he|his|him|she|her|they|their|them|the player|same player|that player|this player|the team|same team|that team)\b/i.test(q);
+    if (!hasPronoun) return;
+
+    // Extract the most recently mentioned player name from history
+    const history = state.conversationHistory ?? [];
+    let lastPlayerName: string | null = null;
+
+    // Walk history newest-first to find the last mentioned entity
+    for (let i = history.length - 1; i >= 0; i--) {
+      const entry = history[i];
+
+      // ── Try to extract from the previous QUESTION (most reliable) ──────────
+      // "tell me about Babar Azam", "Babar Azam ODI stats", "info on Virat Kohli"
+      const qPatterns = [
+        /(?:about|of|for|on|is)\s+(?:player\s+)?([A-Z][a-zA-Z'-]+(?:\s+[A-Z][a-zA-Z'-]+){1,3})/,
+        /^([A-Z][a-zA-Z'-]+(?:\s+[A-Z][a-zA-Z'-]+){1,3})\s+(?:odi|t20|test|stats|batting|bowling|profile|info)/i,
+      ];
+      for (const pat of qPatterns) {
+        const m = entry.question.match(pat);
+        if (m) {
+          const candidate = m[1].trim().replace(/[?!.]+$/, '');
+          if (isValidPlayerName(candidate) && !/\b(odi|t20|test|stats|batting|bowling|match|team)\b/i.test(candidate)) {
+            lastPlayerName = candidate;
+            break;
+          }
+        }
+      }
+      if (lastPlayerName) break;
+
+      // ── Try to extract from the ANSWER ────────────────────────────────────
+      const answer = entry.answer;
+
+      // "**Mohammad Babar Azam**'s shirt number..." or "**Babar Azam (Pakistan)**"
+      const boldMatch = answer.match(/\*\*([A-Z][a-zA-Z'-]+(?:\s+[A-Z][a-zA-Z'-]+){1,4})(?:\s*\([^)]*\))?\*\*/);
+      if (boldMatch) {
+        lastPlayerName = boldMatch[1].trim();
+        break;
+      }
+
+      // "| Name | Mohammad Babar Azam |" from profile table
+      const tableNameMatch = answer.match(/\|\s*Name\s*\|\s*([A-Za-z .'-]{3,50}?)\s*\|/);
+      if (tableNameMatch) {
+        lastPlayerName = tableNameMatch[1].trim();
+        break;
+      }
+
+      // "Babar Azam (Pakistan) — Career Statistics"
+      const headerMatch = answer.match(/([A-Z][a-zA-Z'-]+(?:\s+[A-Z][a-zA-Z'-]+){1,3})\s*(?:\([^)]+\))?\s*—/);
+      if (headerMatch) {
+        lastPlayerName = headerMatch[1].trim();
+        break;
+      }
+    }
+
+    // Also check memory summary
+    if (!lastPlayerName && state.memorySummary) {
+      const m = state.memorySummary.match(/([A-Z][a-zA-Z'-]+(?:\s+[A-Z][a-zA-Z'-]+){1,3})/);
+      if (m) lastPlayerName = m[1].trim();
+    }
+
+    if (!lastPlayerName) return;
+
+    console.log(`=== PRONOUN RESOLUTION: "${q}" → replacing pronoun with "${lastPlayerName}" ===`);
+
+    // Replace pronouns with the resolved entity name
+    const resolved = q
+      .replace(/\b(his|her|their)\b/gi, `${lastPlayerName}'s`)
+      .replace(/\b(he|she|they|him|them)\b/gi, lastPlayerName)
+      .replace(/\b(the player|same player|that player|this player)\b/gi, lastPlayerName)
+      .replace(/\b(the team|same team|that team)\b/gi, lastPlayerName);
+
+    if (resolved !== q) {
+      console.log(`=== PRONOUN RESOLVED: "${resolved}" ===`);
+      state.question = resolved;
+      // Rebuild enriched question with the resolved question
+      state.enrichedQuestion = this.buildEnrichedQuestion(state);
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // NODE 6: MEMORY SAVER
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  private async saveMemory(state: WorkflowState): Promise<void> {
+    if (!state.formattedAnswer) return;
+
+    try {
+      const db = this.databaseService.getDb();
+
+      // Save this conversation turn
+      const entry: ConversationEntry = {
+        userId: state.userId,
+        question: state.question,
+        answer: state.formattedAnswer,
+        timestamp: new Date(),
+      };
+      await db.collection('conversations').insertOne(entry as any);
+
+      // Count total entries for this user
+      const totalEntries = await db
+        .collection('conversations')
+        .countDocuments({ userId: state.userId });
+
+      // If history is too long, summarise and replace
+      if (totalEntries >= MEMORY_SUMMARISE_THRESHOLD) {
+        await this.summariseAndCompressMemory(state, totalEntries);
+      }
+
+      console.log(`=== MEMORY SAVED for user ${state.userId} (total: ${totalEntries + 1}) ===`);
+    } catch (err) {
+      console.warn('Memory save failed (non-fatal):', err.message);
+    }
+  }
+
+  /**
+   * Summarises the full conversation history into a compact memory chunk,
+   * then deletes old entries keeping only the last 3 turns.
+   */
+  private async summariseAndCompressMemory(
+    state: WorkflowState,
+    totalEntries: number,
+  ): Promise<void> {
+    try {
+      const db = this.databaseService.getDb();
+
+      // Fetch all entries for summarisation
+      const allEntries = await db
+        .collection('conversations')
+        .find({ userId: state.userId })
+        .sort({ timestamp: 1 })
+        .toArray() as unknown as ConversationEntry[];
+
+      const historyText = allEntries
+        .map(e => `Q: ${e.question}\nA: ${this.stripTableToSummary(e.answer)}`)
+        .join('\n---\n');
+
+      const summaryPrompt = `You are summarising a cricket chatbot conversation for memory compression.
+Summarise the key facts discussed in this conversation into 3-5 bullet points.
+Focus on: players mentioned, formats discussed (ODI/Test/T20), statistics queried, and any context that would help answer follow-up questions.
+Keep it under 200 words.
+
+Conversation:
+${historyText}
+
+Summary (bullet points):`;
+
+      let summary: string;
+      try {
+        summary = await this.callAI(summaryPrompt, 'llama-3.1-8b-instant');
+        summary = summary.trim();
+      } catch {
+        // Fallback: simple concatenation of last few questions
+        summary = allEntries
+          .slice(-5)
+          .map(e => `Asked about: ${e.question.slice(0, 80)}`)
+          .join('; ');
+      }
+
+      // Upsert summary
+      await db.collection('summaries').updateOne(
+        { userId: state.userId },
+        {
+          $set: {
+            userId: state.userId,
+            summary,
+            updatedAt: new Date(),
+            entryCount: totalEntries,
+          },
+        },
+        { upsert: true },
+      );
+
+      // Keep only the last 3 conversation entries (delete older ones)
+      const keepIds = allEntries
+        .slice(-3)
+        .map((e: any) => e._id);
+
+      await db.collection('conversations').deleteMany({
+        userId: state.userId,
+        _id: { $nin: keepIds },
+      });
+
+      console.log(`=== MEMORY COMPRESSED: ${totalEntries} entries → summary + 3 recent ===`);
+    } catch (err) {
+      console.warn('Memory compression failed (non-fatal):', err.message);
+    }
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -170,6 +639,53 @@ export class LangGraphService {
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
+  // HELPER: DETECT FOLLOW-UP / CONTEXT-DEPENDENT QUESTIONS
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Returns true when the question is a follow-up that needs conversation context
+   * to be answered correctly. In that case we skip the rule-based path and let
+   * the AI resolve the full enriched question.
+   *
+   * A question is a follow-up when ALL of these are true:
+   *  1. There is conversation history for this user
+   *  2. The question contains a pronoun OR is short/vague (no explicit entity)
+   */
+  private isFollowUpQuestion(state: WorkflowState): boolean {
+    // No history → can't be a follow-up
+    if (!state.conversationHistory?.length && !state.memorySummary) return false;
+
+    const q = state.question.toLowerCase().trim();
+    const original = state.question.trim();
+
+    // ── 1. Explicit pronouns — always a follow-up ─────────────────────────────
+    if (/\b(he|his|him|she|her|they|their|them|the player|same player|that player|this player|the team|same team|that team)\b/i.test(q)) {
+      return true;
+    }
+
+    // ── 2. Explicit follow-up openers ─────────────────────────────────────────
+    if (/^(what about|how about|and (in|for|about)|same for|also (show|tell|give)|now (show|tell|what)|what (were|was|is|are) (his|her|their|the)|show me (his|her|their|the)|tell me (more|his|her)|give me (his|her)|and (what|how))\b/i.test(q)) {
+      return true;
+    }
+
+    // ── 3. Short vague questions with no explicit named entity ────────────────
+    const wordCount = q.split(/\s+/).length;
+    if (wordCount <= 6) {
+      // Has an explicit named entity (two+ capitalized words not being format/keyword)?
+      const hasExplicitName = /\b[A-Z][a-zA-Z'-]{2,}(?:\s+[A-Z][a-zA-Z'-]{2,})+\b/.test(original) &&
+        !/^(ODI|T20I?|Test|ICC|BCCI|ECB)\b/.test(original);
+      // Is it a self-contained ranking/list question?
+      const isSelfContained =
+        /\b(top|most|highest|best|list|show|which|who)\b/i.test(q) &&
+        /\b(odi|t20i?|test)\b/i.test(q) &&
+        /\b(runs?|wickets?|centuries|wins?|matches?|scorers?|takers?|batsmen?|bowlers?)\b/i.test(q);
+      if (!hasExplicitName && !isSelfContained) return true;
+    }
+
+    return false;
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
   // NODE: RULE-BASED QUERY (no AI, zero tokens)
   // ─────────────────────────────────────────────────────────────────────────────
 
@@ -177,17 +693,51 @@ export class LangGraphService {
     const q = state.question.toLowerCase().trim();
 
     // ── Player profile ────────────────────────────────────────────────────────
+    // Attribute keywords that should NOT be part of the player name
+    const PLAYER_ATTR_SUFFIX =
+      /\s+(?:batting\s+style|bowling\s+style|batting|bowling|age|dob|date\s+of\s+birth|birthday|nationality|country|profile|details?|info(?:rmation)?|career|stats?|record|bio(?:graphy)?|shirt\s+number|jersey)[?!.]*$/i;
+
+    /**
+     * Returns true only if the string looks like a real player/person name:
+     * - 2–4 words
+     * - Each word starts with a capital letter (or is a known connector like "de", "van", "al")
+     * - Does NOT contain question/stats words
+     */
+    const looksLikePlayerName = (s: string): boolean => {
+      if (!isValidPlayerName(s)) return false;
+      // Reject if it contains stats/match/question/ranking words
+      if (/\b(how|many|odi|t20|test|played|play|in|at|were|was|are|is|did|has|have|which|who|what|when|where|why|match|matches|runs?|wickets?|score|century|centuries|average|stats?|record|team|venue|ground|stadium|sharjah|dubai|lords?|melbourne|sydney|wankhede|eden|top|most|best|highest|leading|list|show|find|get|display|all|total|number|count)\b/i.test(s)) return false;
+      // Reject if contains digits (e.g. "top 5", "last 10")
+      if (/\d/.test(s)) return false;
+      // Reject known team/country names
+      if (/^(india|pakistan|australia|england|new zealand|south africa|sri lanka|bangladesh|west indies|zimbabwe|afghanistan|ireland|scotland|netherlands|kenya|canada|usa|united states|namibia|oman|uae|united arab emirates|nepal|hong kong|singapore|malaysia|png|papua new guinea)$/i.test(s)) return false;
+      // Reject if more than 5 words (sentences, not names)
+      const words = s.trim().split(/\s+/);
+      if (words.length > 5) return false;
+      return true;
+    };
+
     const playerDetailPatterns = [
       /(?:details?|info(?:rmation)?|profile)\s+(?:of|about|on|for)\s+(?:player\s+)?(.+)/i,
       /(?:who\s+is|tell\s+me\s+about(?:\s+player)?)\s+(.+)/i,
       /(?:player\s+)?(.+?)\s+(?:details?|info(?:rmation)?|profile)/i,
+      // "what is [player]'s batting style / age / dob / country"
+      /(?:what\s+is|what\s+are|what\s+was)\s+(.+?)'?s?\s+(?:batting\s+style|bowling\s+style|age|dob|date\s+of\s+birth|birthday|nationality|country|shirt\s+number|jersey)[?!.]*$/i,
+      // "Babar Azam batting style" — name followed directly by an attribute
+      /^(.+?)\s+(?:batting\s+style|bowling\s+style|age|dob|date\s+of\s+birth|birthday|nationality|country|shirt\s+number|jersey)[?!.]*$/i,
     ];
 
     for (const pattern of playerDetailPatterns) {
       const match = state.question.match(pattern);
       if (match) {
-        const playerName = match[1].trim().replace(/[?!.]+$/, '');
-        if (!isValidPlayerName(playerName)) continue;
+        // Strip trailing attribute words and format words before validating the name
+        const playerName = match[1]
+          .trim()
+          .replace(/[?!.]+$/, '')
+          .replace(PLAYER_ATTR_SUFFIX, '')
+          .replace(/\s+\b(odi|t20i?|test)\b.*$/i, '')
+          .trim();
+        if (!looksLikePlayerName(playerName)) continue;
         console.log(`=== RULE-BASED: player profile lookup for "${playerName}" ===`);
         state.generatedQuery = {
           collection: 'players',
@@ -204,18 +754,23 @@ export class LangGraphService {
     }
 
     // ── Player career stats (runs/wickets/average) by name ───────────────────
+    const FORMAT_SUFFIX = /\s+\b(odi|t20i?|test)\b.*$/i;
+
     const playerStatsPatterns = [
       /(?:how\s+many\s+(?:runs?|wickets?|centuries|fifties|matches?))\s+(?:did|has|have)\s+(.+?)\s+(?:score|take|play|make|get)/i,
       /(?:what\s+(?:is|are|was|were))\s+(.+?)'?s?\s+(?:batting|bowling|career|overall)?\s*(?:stats?|average|record|figures?)/i,
       /(.+?)\s+(?:odi|t20i?|test)\s+(?:career\s+)?(?:stats?|record|figures?|average|runs?|wickets?)/i,
       /(?:career\s+)?(?:stats?|record|figures?)\s+(?:of|for)\s+(.+?)(?:\s+in\s+(odi|t20i?|test))?/i,
+      // "Rohit Sharma ODI" or "Rohit Sharma T20I stats" — name must start with capital
+      /^([A-Z][a-zA-Z'-]+(?:\s+[A-Z][a-zA-Z'-]+){1,3})\s+(?:odi|t20i?|test)(?:\s+(?:stats?|record|figures?|average|runs?|wickets?))?[?!.]*$/i,
     ];
 
     for (const pattern of playerStatsPatterns) {
       const match = state.question.match(pattern);
       if (match) {
-        const playerName = match[1].trim().replace(/[?!.]+$/, '');
-        if (!isValidPlayerName(playerName)) continue;
+        // Strip trailing format words (ODI/T20I/Test) from the captured name
+        const playerName = match[1].trim().replace(/[?!.]+$/, '').replace(FORMAT_SUFFIX, '').trim();
+        if (!looksLikePlayerName(playerName)) continue;
 
         let format: string | null = null;
         const fmtMatch = state.question.match(/\b(odi|t20i?|test)\b/i);
@@ -283,8 +838,11 @@ export class LangGraphService {
     }
 
     // ── Most wins by team ─────────────────────────────────────────────────────
+    // Guard: skip if question specifies a venue (handled by mostWinsAtVenuePattern below)
+    const hasVenueContext = /\b(?:at|in)\s+[A-Za-z]/i.test(state.question) &&
+      /\b(?:lords?|wankhede|eden|melbourne|sydney|oval|headingley|edgbaston|trent|sharjah|dubai|karachi|lahore|chennai|delhi|mumbai|kolkata|bangalore|bengaluru|ahmedabad|johannesburg|cape\s*town|centurion|durban|christchurch|wellington|hamilton|hobart|brisbane|perth)\b/i.test(state.question);
     const mostWinsPattern = /(?:most\s+wins?|which\s+team\s+(?:has|have|won)\s+(?:the\s+)?most|team\s+with\s+(?:the\s+)?most\s+wins?)/i;
-    if (mostWinsPattern.test(state.question)) {
+    if (mostWinsPattern.test(state.question) && !hasVenueContext) {
       const fmtM = state.question.match(/\b(odi|t20i?|test)\b/i);
       const fmt = fmtM ? (fmtM[1].toUpperCase() === 'T20' ? 'T20I' : fmtM[1].toUpperCase()) : null;
       const matchStage: any = { result: 'won' };
@@ -414,10 +972,60 @@ export class LangGraphService {
       return;
     }
 
+    // ── Most wins / most matches at a venue ──────────────────────────────────
+    const mostWinsAtVenuePattern =
+      /(?:which\s+team|who)\s+(?:has|have)?\s*(?:won\s+the\s+most|most\s+wins?|most\s+matches?\s+won)\s+(?:matches?\s+)?(?:at|in)\s+([A-Za-z ()]+?)(?:\s+in\s+(odi|t20i?|test))?[?!.]*$/i;
+    const mostWinsAtVenueMatch = state.question.match(mostWinsAtVenuePattern);
+    if (mostWinsAtVenueMatch) {
+      const rawVenue = mostWinsAtVenueMatch[1].trim().replace(/[?!.]+$/, '');
+      const venue = this.normalizeVenueName(rawVenue);
+      const fmtRaw = mostWinsAtVenueMatch[2];
+      const fmt = fmtRaw ? (fmtRaw.toUpperCase() === 'T20' ? 'T20I' : fmtRaw.toUpperCase() === 'TEST' ? 'TEST' : fmtRaw.toUpperCase()) : null;
+      const matchStage: any = { venue: { $regex: venue, $options: 'i' }, result: 'won' };
+      if (fmt) matchStage.format = fmt;
+      console.log(`=== RULE-BASED: most wins at venue "${rawVenue}" format=${fmt} ===`);
+      state.generatedQuery = {
+        collection: 'team_matches',
+        pipeline: [
+          { $match: matchStage },
+          { $group: { _id: '$team', wins: { $sum: 1 } } },
+          { $sort: { wins: -1 } },
+          { $limit: 10 },
+        ],
+      };
+      return;
+    }
+
+    // ── Most matches played at a venue ────────────────────────────────────────
+    const mostMatchesAtVenuePattern =
+      /(?:which\s+team|who)\s+(?:has|have)?\s*(?:played\s+the\s+most|most\s+matches?\s+played)\s+(?:matches?\s+)?(?:at|in)\s+([A-Za-z ()]+?)(?:\s+in\s+(odi|t20i?|test))?[?!.]*$/i;
+    const mostMatchesAtVenueMatch = state.question.match(mostMatchesAtVenuePattern);
+    if (mostMatchesAtVenueMatch) {
+      const rawVenue = mostMatchesAtVenueMatch[1].trim().replace(/[?!.]+$/, '');
+      const venue = this.normalizeVenueName(rawVenue);
+      const fmtRaw = mostMatchesAtVenueMatch[2];
+      const fmt = fmtRaw ? (fmtRaw.toUpperCase() === 'T20' ? 'T20I' : fmtRaw.toUpperCase() === 'TEST' ? 'TEST' : fmtRaw.toUpperCase()) : null;
+      const matchStage: any = { venue: { $regex: venue, $options: 'i' } };
+      if (fmt) matchStage.format = fmt;
+      console.log(`=== RULE-BASED: most matches at venue "${rawVenue}" format=${fmt} ===`);
+      state.generatedQuery = {
+        collection: 'team_matches',
+        pipeline: [
+          { $match: matchStage },
+          { $group: { _id: '$team', matches: { $sum: 1 } } },
+          { $sort: { matches: -1 } },
+          { $limit: 10 },
+        ],
+      };
+      return;
+    }
+
     // ── Matches at a venue ────────────────────────────────────────────────────
+    // Guard: skip if the question is asking for aggregation (most/which team/who won)
+    const isAggregationQuestion = /\b(?:most|which\s+team|who\s+(?:has|have|won)|highest|top|best|most\s+wins?)\b/i.test(state.question);
     const venuePattern = /matches?\s+(?:played\s+)?(?:at|in)\s+([A-Za-z ()]+?)(?:\s+(?:where|with|when|and|in\s+\d{4})|[?!.]|$)/i;
     const venueMatch = state.question.match(venuePattern);
-    if (venueMatch) {
+    if (venueMatch && !isAggregationQuestion) {
       const rawVenue = venueMatch[1].trim().replace(/[?!.]+$/, '');
       const venue = this.normalizeVenueName(rawVenue);
       console.log(`=== RULE-BASED: matches at venue "${rawVenue}" → normalized: "${venue}" ===`);
@@ -558,13 +1166,60 @@ export class LangGraphService {
     // ── Toss win → match win correlation ─────────────────────────────────────
     const tossWinMatchWinPattern =
       /(?:how\s+many\s+times?|count|number\s+of\s+times?).*toss.*(?:win|won).*(?:match|game).*(?:win|won)|toss\s+winner.*(?:win|won)|(?:win|won).*toss.*(?:win|won)\s+(?:the\s+)?match/i;
+    const tossWinByTeamPattern =
+      /(?:which\s+team|who).*(?:won\s+(?:the\s+)?toss.*won\s+(?:the\s+)?match|toss.*(?:win|won).*most)/i;
+
+    if (tossWinByTeamPattern.test(state.question)) {
+      // "which team won the toss and won the match most times?" → group by team
+      const fmtM = state.question.match(/\b(odi|t20i?|test)\b/i);
+      const fmt = fmtM ? (fmtM[1].toUpperCase() === 'T20' ? 'T20I' : fmtM[1].toUpperCase() === 'TEST' ? 'TEST' : fmtM[1].toUpperCase()) : null;
+      const matchStage: any = { toss: 'won', result: 'won' };
+      if (fmt) matchStage.format = fmt;
+      console.log(`=== RULE-BASED: toss win → match win by team format=${fmt} ===`);
+      state.generatedQuery = {
+        collection: 'team_matches',
+        pipeline: [
+          { $match: matchStage },
+          { $group: { _id: '$team', times: { $sum: 1 } } },
+          { $sort: { times: -1 } },
+          { $limit: 10 },
+        ],
+      };
+      return;
+    }
+
     if (tossWinMatchWinPattern.test(state.question)) {
-      console.log(`=== RULE-BASED: toss win → match win ===`);
+      // "how many times did toss winner win the match?" → total count
+      console.log(`=== RULE-BASED: toss win → match win (total count) ===`);
       state.generatedQuery = {
         collection: 'team_matches',
         pipeline: [
           { $match: { toss: 'won', result: 'won' } },
           { $count: 'times_toss_winner_won_match' },
+        ],
+      };
+      return;
+    }
+
+    // ── Who has the highest individual score (player) ─────────────────────────
+    const playerHighestScorePattern =
+      /(?:who\s+(?:has|holds?|scored?|made?|hit)\s+(?:the\s+)?(?:highest|most|maximum|top|best)\s+(?:individual\s+)?(?:score|runs?|innings?))|(?:highest\s+(?:individual\s+)?(?:score|innings?)\s+(?:by\s+a\s+(?:player|batsman|batter)?))/i;
+    if (playerHighestScorePattern.test(state.question)) {
+      const fmtM = state.question.match(/\b(odi|t20i?|test)\b/i);
+      const fmt = fmtM
+        ? fmtM[1].toUpperCase() === 'T20' ? 'T20I'
+          : fmtM[1].toUpperCase() === 'TEST' ? 'Test'
+          : fmtM[1].toUpperCase()
+        : null;
+      const matchStage: any = { runs: { $gt: 0 } };
+      if (fmt) matchStage.format = fmt;
+      console.log(`=== RULE-BASED: player highest individual score format=${fmt} ===`);
+      state.generatedQuery = {
+        collection: 'players_yearly',
+        pipeline: [
+          { $match: matchStage },
+          { $sort: { highest_score: -1 } },
+          { $limit: 10 },
         ],
       };
       return;
@@ -695,6 +1350,14 @@ export class LangGraphService {
 
     const userPrompt = `Generate a MongoDB query JSON for this cricket stats question.
 
+IMPORTANT — FOLLOW-UP QUESTION HANDLING:
+The question may be a follow-up to a previous conversation. The [Recent conversation] context shows what was discussed before.
+- If the question uses pronouns ("he", "his", "she", "her", "they", "their") → replace with the player/team name from context
+- If the question is short and vague ("how many centuries in ODI?", "what about T20?", "show me bowling stats") → use the player/team from the most recent conversation turn
+- If the question asks about a specific attribute ("shirt number", "batting style", "age", "country") → query the "players" collection for the player from context
+- Always extract the actual entity (player name, team name, format) from context before generating the query
+- NEVER generate a query with a placeholder like "player_name" — always use the real name from context
+
 COLLECTIONS:
 1. "players": player_id, short_name, full_name, active, date_of_birth, format, country, shirt_number, batting_style, bowling_style, picture
    → Use ONLY for player profile/details/info/biography questions (not stats)
@@ -752,7 +1415,15 @@ EXAMPLES:
 {"collection":"team_matches","pipeline":[{"$match":{"team":{"$regex":"India","$options":"i"}}},{"$group":{"_id":"$result","count":{"$sum":1}}},{"$sort":{"count":-1}}]}
 {"collection":"team_matches","pipeline":[{"$match":{"venue":{"$regex":"Sharjah","$options":"i"},"margin":{"$regex":"runs","$options":"i"}}},{"$addFields":{"margin_runs":{"$convert":{"input":{"$arrayElemAt":[{"$split":["$margin"," "]},0]},"to":"int","onError":0,"onNull":0}}}},{"$match":{"margin_runs":{"$gt":100}}},{"$sort":{"margin_runs":-1}},{"$limit":20}]}
 
-Question: "${state.question}"`;
+PLAYER STATS BY NAME — CRITICAL:
+players_yearly and players_matches do NOT have short_name/full_name — only player_id (a number).
+When asked for a specific player's stats by name, use short_name $regex filter on players_yearly.
+The system will automatically look up the player_id and re-query. Always use the player's name from context.
+{"collection":"players_yearly","filter":{"short_name":{"$regex":"Babar Azam","$options":"i"},"format":"ODI"},"sort":{"year":-1},"limit":20}
+{"collection":"players_yearly","filter":{"short_name":{"$regex":"Virat Kohli","$options":"i"}},"sort":{"year":-1},"limit":20}
+{"collection":"players_matches","filter":{"short_name":{"$regex":"Rohit Sharma","$options":"i"},"format":"Test"},"sort":{"date":-1},"limit":20}
+
+Question: "${state.enrichedQuestion ?? state.question}"`;
 
     try {
       const response = await this.callAI(userPrompt, GROQ_MODEL_CHAIN[0], systemPrompt);
@@ -872,6 +1543,27 @@ Question: "${state.question}"`;
 
       this.normalizeQuery(state.generatedQuery);
 
+      // ── Intercept AI-generated name-based queries on players_yearly/players_matches ──
+      // The AI sometimes generates filters with short_name/full_name on these collections
+      // which don't have those fields. Detect and redirect to the _playerNameLookup path.
+      const col = state.generatedQuery.collection;
+      if (col === 'players_yearly' || col === 'players_matches') {
+        const nameFromFilter = this.extractNameFromQuery(state.generatedQuery);
+        if (nameFromFilter) {
+          console.log(`=== INTERCEPTED: AI used name filter on ${col}, redirecting to player lookup for "${nameFromFilter}" ===`);
+          state.generatedQuery._playerNameLookup = nameFromFilter;
+          // Extract format if present
+          const fmt = this.extractFormatFromQuery(state.generatedQuery);
+          if (fmt) state.generatedQuery._format = fmt;
+          // Extract opponent if present
+          const opp = this.extractOpponentFromQuery(state.generatedQuery);
+          if (opp) state.generatedQuery._opponent = opp;
+          // Re-run through the _playerNameLookup path by recursing into executeQuery
+          await this.executeQuery(state);
+          return;
+        }
+      }
+
       const {
         collection: collectionName,
         pipeline,
@@ -979,6 +1671,80 @@ Question: "${state.question}"`;
 
   // ─────────────────────────────────────────────────────────────────────────────
   // HELPER: NORMALIZE QUERY
+  // ─────────────────────────────────────────────────────────────────────────────
+  // HELPERS: EXTRACT FIELDS FROM AI-GENERATED QUERY
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  /** Extracts a player name from short_name/$regex or full_name/$regex filters */
+  private extractNameFromQuery(query: any): string | null {
+    const searchIn = (obj: any): string | null => {
+      if (!obj || typeof obj !== 'object') return null;
+      // Direct regex on name fields
+      for (const nameField of ['short_name', 'full_name', 'player_name', 'name']) {
+        if (obj[nameField]?.$regex) return obj[nameField].$regex;
+        if (typeof obj[nameField] === 'string') return obj[nameField];
+      }
+      // $or array
+      if (Array.isArray(obj.$or)) {
+        for (const clause of obj.$or) {
+          const found = searchIn(clause);
+          if (found) return found;
+        }
+      }
+      return null;
+    };
+
+    // Check filter
+    if (query.filter) {
+      const found = searchIn(query.filter);
+      if (found) return found;
+    }
+    // Check pipeline $match stages
+    if (Array.isArray(query.pipeline)) {
+      for (const stage of query.pipeline) {
+        if (stage.$match) {
+          const found = searchIn(stage.$match);
+          if (found) return found;
+        }
+      }
+    }
+    return null;
+  }
+
+  /** Extracts format value from query filter or pipeline */
+  private extractFormatFromQuery(query: any): string | null {
+    if (query.filter?.format) return query.filter.format;
+    if (Array.isArray(query.pipeline)) {
+      for (const stage of query.pipeline) {
+        if (stage.$match?.format) return stage.$match.format;
+      }
+    }
+    return null;
+  }
+
+  /** Extracts opponent value from query filter or pipeline */
+  private extractOpponentFromQuery(query: any): string | null {
+    const searchIn = (obj: any): string | null => {
+      if (!obj || typeof obj !== 'object') return null;
+      if (obj.opponent?.$regex) return obj.opponent.$regex;
+      if (typeof obj.opponent === 'string') return obj.opponent;
+      return null;
+    };
+    if (query.filter) {
+      const found = searchIn(query.filter);
+      if (found) return found;
+    }
+    if (Array.isArray(query.pipeline)) {
+      for (const stage of query.pipeline) {
+        if (stage.$match) {
+          const found = searchIn(stage.$match);
+          if (found) return found;
+        }
+      }
+    }
+    return null;
+  }
+
   // ─────────────────────────────────────────────────────────────────────────────
 
   private normalizeQuery(query: any): void {
@@ -1108,6 +1874,13 @@ Question: "${state.question}"`;
     }
 
     if (state.generatedQuery?.collection === 'players') {
+      // Check if the question asks for a specific field — return a direct answer
+      const specificAnswer = this.extractSpecificPlayerField(state.queryResults[0], state.question);
+      if (specificAnswer) {
+        state.formattedAnswer = specificAnswer;
+        state.answerType = 'text';
+        return;
+      }
       state.formattedAnswer = this.buildPlayerProfileTable(state.queryResults);
       state.answerType = 'table';
       return;
@@ -1184,6 +1957,65 @@ Answer:`;
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
+  // HELPER: EXTRACT SPECIFIC PLAYER FIELD FOR DIRECT ANSWERS
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  /**
+   * When the user asks about a specific attribute (shirt number, batting style,
+   * age, country, etc.), return a direct one-line answer instead of the full table.
+   * Returns null if the question is a general profile/info request.
+   */
+  private extractSpecificPlayerField(player: any, question: string): string | null {
+    if (!player) return null;
+
+    const q = question.toLowerCase();
+    const name = player.full_name || player.short_name || 'The player';
+
+    // Map of question keywords → player document fields
+    const fieldMap: Array<{ keywords: string[]; field: string; label: string }> = [
+      { keywords: ['shirt number', 'jersey number', 'jersey', 'shirt no', 'shirt #'], field: 'shirt_number', label: 'shirt number' },
+      { keywords: ['batting style', 'how does he bat', 'how does she bat', 'bat style'], field: 'batting_style', label: 'batting style' },
+      { keywords: ['bowling style', 'how does he bowl', 'how does she bowl', 'bowl style'], field: 'bowling_style', label: 'bowling style' },
+      { keywords: ['date of birth', 'dob', 'birthday', 'born', 'birth date'], field: 'date_of_birth', label: 'date of birth' },
+      { keywords: ['age', 'how old'], field: 'date_of_birth', label: 'age' },
+      { keywords: ['country', 'nationality', 'nation', 'from which country', 'which country'], field: 'country', label: 'country' },
+      { keywords: ['active', 'still playing', 'retired', 'is he playing'], field: 'active', label: 'active status' },
+      { keywords: ['full name', 'real name', 'complete name'], field: 'full_name', label: 'full name' },
+    ];
+
+    for (const { keywords, field, label } of fieldMap) {
+      if (keywords.some(kw => q.includes(kw))) {
+        const value = player[field];
+        if (value === undefined || value === null || value === '') {
+          return `${name}'s ${label} is not available in the dataset.`;
+        }
+
+        // Special handling for age calculation
+        if (label === 'age' && field === 'date_of_birth') {
+          try {
+            const dob = new Date(value);
+            const today = new Date();
+            const age = today.getFullYear() - dob.getFullYear() -
+              (today < new Date(today.getFullYear(), dob.getMonth(), dob.getDate()) ? 1 : 0);
+            return `**${name}** is **${age} years old** (born ${value}).`;
+          } catch {
+            return `**${name}**'s date of birth is **${value}**.`;
+          }
+        }
+
+        return `**${name}**'s ${label} is **${value}**.`;
+      }
+    }
+
+    // If the question is a general "tell me about" / "profile" / "info" → return null (show full table)
+    const isGeneralProfile = /\b(profile|details?|info(?:rmation)?|tell me about|who is|biography|bio)\b/i.test(q);
+    if (isGeneralProfile) return null;
+
+    // If the question only mentions the player name with no specific field → full table
+    return null;
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
   // HELPER: BUILD PLAYER PROFILE TABLE
   // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1212,66 +2044,55 @@ Answer:`;
   private buildPlayerStatsTable(results: any[], question: string): string {
     if (results.length === 0) return 'No statistics found.';
 
-    const q = question.toLowerCase();
-    const isBowlingQ = q.includes('wicket') || q.includes('bowl');
-    const isBattingQ = q.includes('run') || q.includes('bat') || q.includes('average') || q.includes('century') || q.includes('centur') || q.includes('hundred');
-
     const playerName = results[0]?.player_name ?? 'Player';
     const country = results[0]?.player_country ? ` (${results[0].player_country})` : '';
 
+    // Helper: check if a field has any real value across all rows
+    const hasData = (field: string): boolean =>
+      results.some(r => r[field] !== undefined && r[field] !== null && r[field] !== '' && r[field] !== 0 && r[field] !== '0');
+
+    // Always-present columns
+    type Col = { header: string; getValue: (r: any) => string };
+    const cols: Col[] = [
+      { header: 'Year',   getValue: r => String(r.year ?? '-') },
+      { header: 'Format', getValue: r => String(r.format ?? '-') },
+      { header: 'M',      getValue: r => r.matches !== undefined && r.matches !== '' ? String(r.matches) : '-' },
+    ];
+
+    // Batting columns — only if any row has data
+    if (hasData('runs'))          cols.push({ header: 'Runs',    getValue: r => r.runs !== '' && r.runs !== undefined ? String(r.runs) : '-' });
+    if (hasData('highest_score')) cols.push({ header: 'HS',      getValue: r => r.highest_score || '-' });
+    if (hasData('average'))       cols.push({ header: 'Avg',     getValue: r => r.average !== '' && r.average !== undefined ? String(r.average) : '-' });
+    if (hasData('hundreds'))      cols.push({ header: '100s',    getValue: r => r.hundreds !== '' && r.hundreds !== undefined ? String(r.hundreds) : '-' });
+
+    // Bowling columns — only if any row has data
+    if (hasData('wickets'))           cols.push({ header: 'Wkts',    getValue: r => r.wickets !== '' && r.wickets !== undefined ? String(r.wickets) : '-' });
+    if (hasData('best_bowling'))      cols.push({ header: 'Best',    getValue: r => r.best_bowling || '-' });
+    if (hasData('bowl_avg'))          cols.push({ header: 'BowlAvg', getValue: r => r.bowl_avg !== '' && r.bowl_avg !== undefined ? String(r.bowl_avg) : '-' });
+    if (hasData('five_wicket_hauls')) cols.push({ header: '5W',      getValue: r => r.five_wicket_hauls !== '' && r.five_wicket_hauls !== undefined ? String(r.five_wicket_hauls) : '-' });
+
+    // Fielding columns — only if any row has data
+    if (hasData('catches'))   cols.push({ header: 'Ct', getValue: r => r.catches !== '' && r.catches !== undefined ? String(r.catches) : '-' });
+    if (hasData('stumpings')) cols.push({ header: 'St', getValue: r => r.stumpings !== '' && r.stumpings !== undefined ? String(r.stumpings) : '-' });
+
     const lines: string[] = [];
     lines.push(`**${playerName}${country} — Career Statistics**\n`);
-
-    const showBatting = !isBowlingQ || isBattingQ || (!isBowlingQ && !isBattingQ);
-    const showBowling = isBowlingQ || (!isBowlingQ && !isBattingQ);
-
-    const headers: string[] = ['Year', 'Format', 'M'];
-    if (showBatting) headers.push('Runs', 'HS', 'Avg', '100s', '50s');
-    if (showBowling) headers.push('Wkts', 'Best', 'BowlAvg', '5W');
-    headers.push('Ct', 'St');
-
-    lines.push(`| ${headers.join(' | ')} |`);
-    lines.push(`| ${headers.map(() => '---').join(' | ')} |`);
+    lines.push(`| ${cols.map(c => c.header).join(' | ')} |`);
+    lines.push(`| ${cols.map(() => '---').join(' | ')} |`);
 
     let totalRuns = 0, totalWkts = 0, totalMatches = 0, totalHundreds = 0;
 
     for (const r of results) {
-      const row: string[] = [
-        String(r.year ?? '-'),
-        String(r.format ?? '-'),
-        String(r.matches ?? '-'),
-      ];
-      if (showBatting) {
-        row.push(
-          r.runs !== '' && r.runs !== undefined ? String(r.runs) : '-',
-          r.highest_score || '-',
-          r.average !== '' && r.average !== undefined ? String(r.average) : '-',
-          r.hundreds !== '' && r.hundreds !== undefined ? String(r.hundreds) : '-',
-          '-',
-        );
-        if (typeof r.runs === 'number') totalRuns += r.runs;
-        if (typeof r.hundreds === 'number') totalHundreds += r.hundreds;
-      }
-      if (showBowling) {
-        row.push(
-          r.wickets !== '' && r.wickets !== undefined ? String(r.wickets) : '-',
-          r.best_bowling || '-',
-          r.bowl_avg !== '' && r.bowl_avg !== undefined ? String(r.bowl_avg) : '-',
-          r.five_wicket_hauls !== '' && r.five_wicket_hauls !== undefined ? String(r.five_wicket_hauls) : '-',
-        );
-        if (typeof r.wickets === 'number') totalWkts += r.wickets;
-      }
-      row.push(
-        r.catches !== '' && r.catches !== undefined ? String(r.catches) : '-',
-        r.stumpings !== '' && r.stumpings !== undefined ? String(r.stumpings) : '-',
-      );
+      lines.push(`| ${cols.map(c => c.getValue(r)).join(' | ')} |`);
       if (typeof r.matches === 'number') totalMatches += r.matches;
-      lines.push(`| ${row.join(' | ')} |`);
+      if (typeof r.runs === 'number') totalRuns += r.runs;
+      if (typeof r.hundreds === 'number') totalHundreds += r.hundreds;
+      if (typeof r.wickets === 'number') totalWkts += r.wickets;
     }
 
     const summaryParts: string[] = [`Total matches: **${totalMatches}**`];
-    if (showBatting && totalRuns > 0) summaryParts.push(`runs: **${totalRuns}**`, `centuries: **${totalHundreds}**`);
-    if (showBowling && totalWkts > 0) summaryParts.push(`wickets: **${totalWkts}**`);
+    if (totalRuns > 0)   summaryParts.push(`runs: **${totalRuns}**`, `centuries: **${totalHundreds}**`);
+    if (totalWkts > 0)   summaryParts.push(`wickets: **${totalWkts}**`);
     lines.push(`\n${summaryParts.join(' | ')}`);
 
     return lines.join('\n');
@@ -1284,45 +2105,42 @@ Answer:`;
   private buildPlayerMatchTable(results: any[], question: string): string {
     if (results.length === 0) return 'No match records found.';
 
-    const q = question.toLowerCase();
-    const isBowling = q.includes('wicket') || q.includes('bowl');
     const playerName = results[0]?.player_name ?? 'Player';
     const country = results[0]?.player_country ? ` (${results[0].player_country})` : '';
 
+    // Helper: check if a field has any real value across all rows
+    const hasData = (field: string): boolean =>
+      results.some(r => r[field] !== undefined && r[field] !== null && r[field] !== '' && r[field] !== 0 && r[field] !== '0');
+
+    type Col = { header: string; getValue: (r: any) => string };
+    const cols: Col[] = [
+      { header: 'Date',     getValue: r => r.date ? String(r.date).slice(0, 10) : '-' },
+      { header: 'Format',   getValue: r => r.format ?? '-' },
+      { header: 'Opponent', getValue: r => r.opponent ?? '-' },
+      { header: 'Venue',    getValue: r => r.venue ?? '-' },
+      { header: 'Result',   getValue: r => r.result ?? '-' },
+    ];
+
+    // Batting columns — only if any row has data
+    if (hasData('runs'))        cols.push({ header: 'Runs',  getValue: r => r.runs !== undefined && r.runs !== '' ? String(r.runs) : '-' });
+    if (hasData('balls'))       cols.push({ header: 'Balls', getValue: r => r.balls !== undefined && r.balls !== '' ? String(r.balls) : '-' });
+    if (hasData('fours'))       cols.push({ header: '4s',    getValue: r => r.fours !== undefined && r.fours !== '' ? String(r.fours) : '-' });
+    if (hasData('sixes'))       cols.push({ header: '6s',    getValue: r => r.sixes !== undefined && r.sixes !== '' ? String(r.sixes) : '-' });
+    if (hasData('strike_rate')) cols.push({ header: 'SR',    getValue: r => r.strike_rate !== undefined && r.strike_rate !== '' ? String(r.strike_rate) : '-' });
+
+    // Bowling columns — only if any row has data
+    if (hasData('wickets_bowling')) cols.push({ header: 'Wkts',          getValue: r => r.wickets_bowling !== undefined && r.wickets_bowling !== '' ? String(r.wickets_bowling) : '-' });
+    if (hasData('overs'))           cols.push({ header: 'Overs',         getValue: r => r.overs !== undefined && r.overs !== '' ? String(r.overs) : '-' });
+    if (hasData('runs_conceded'))   cols.push({ header: 'Runs Conceded', getValue: r => r.runs_conceded !== undefined && r.runs_conceded !== '' ? String(r.runs_conceded) : '-' });
+    if (hasData('economy'))         cols.push({ header: 'Econ',          getValue: r => r.economy !== undefined && r.economy !== '' ? String(r.economy) : '-' });
+
     const lines: string[] = [];
     lines.push(`**${playerName}${country} — Match Records**\n`);
-
-    const headers = ['Date', 'Format', 'Opponent', 'Venue', 'Result'];
-    if (!isBowling) headers.push('Runs', 'Balls', '4s', '6s', 'SR');
-    headers.push('Wkts', 'Overs', 'Runs Conceded', 'Econ');
-
-    lines.push(`| ${headers.join(' | ')} |`);
-    lines.push(`| ${headers.map(() => '---').join(' | ')} |`);
+    lines.push(`| ${cols.map(c => c.header).join(' | ')} |`);
+    lines.push(`| ${cols.map(() => '---').join(' | ')} |`);
 
     for (const r of results) {
-      const row = [
-        r.date ? String(r.date).slice(0, 10) : '-',
-        r.format ?? '-',
-        r.opponent ?? '-',
-        r.venue ?? '-',
-        r.result ?? '-',
-      ];
-      if (!isBowling) {
-        row.push(
-          r.runs !== undefined && r.runs !== '' ? String(r.runs) : '-',
-          r.balls !== undefined && r.balls !== '' ? String(r.balls) : '-',
-          r.fours !== undefined && r.fours !== '' ? String(r.fours) : '-',
-          r.sixes !== undefined && r.sixes !== '' ? String(r.sixes) : '-',
-          r.strike_rate !== undefined && r.strike_rate !== '' ? String(r.strike_rate) : '-',
-        );
-      }
-      row.push(
-        r.wickets_bowling !== undefined && r.wickets_bowling !== '' ? String(r.wickets_bowling) : '-',
-        r.overs !== undefined && r.overs !== '' ? String(r.overs) : '-',
-        r.runs_conceded !== undefined && r.runs_conceded !== '' ? String(r.runs_conceded) : '-',
-        r.economy !== undefined && r.economy !== '' ? String(r.economy) : '-',
-      );
-      lines.push(`| ${row.join(' | ')} |`);
+      lines.push(`| ${cols.map(c => c.getValue(r)).join(' | ')} |`);
     }
 
     return lines.join('\n');
@@ -1352,12 +2170,49 @@ Answer:`;
       ['sharjah', 'dubai', 'lahore', 'karachi', 'mumbai', 'delhi'].some(v => q.includes(v));
     const isTeamMatch = results[0]?.score !== undefined || results[0]?.margin !== undefined;
 
+    // Detect $group aggregation results: { _id: <value>, someMetric: <number> }
+    // Remap _id to a meaningful label so it shows in the table
+    const first = results[0];
+    const isGroupResult =
+      first !== undefined &&
+      first._id !== undefined &&
+      typeof first._id === 'string' &&
+      Object.keys(first).filter(k => k !== '_id').every(k => typeof first[k] === 'number');
+
+    if (isGroupResult) {
+      // Determine the label for _id based on question context
+      let idLabel = 'Team';
+      if (q.includes('player') || q.includes('batsman') || q.includes('bowler')) idLabel = 'Player';
+      else if (q.includes('format')) idLabel = 'Format';
+      else if (q.includes('venue') || q.includes('ground') || q.includes('stadium')) idLabel = 'Venue';
+      else if (q.includes('year')) idLabel = 'Year';
+      else if (q.includes('result')) idLabel = 'Result';
+
+      // Build metric labels from the other keys
+      const metricKeys = Object.keys(first).filter(k => k !== '_id');
+
+      const headers = ['#', idLabel, ...metricKeys.map(k =>
+        k.replace(/^total_/, '').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()),
+      )];
+      const separator = headers.map(() => '---');
+
+      const rows = results.map((row, i) => [
+        String(i + 1),
+        row._id ?? '-',
+        ...metricKeys.map(k => (row[k] !== undefined && row[k] !== null ? String(row[k]) : '-')),
+      ]);
+
+      return [
+        `| ${headers.join(' | ')} |`,
+        `| ${separator.join(' | ')} |`,
+        ...rows.map(r => `| ${r.join(' | ')} |`),
+      ].join('\n');
+    }
+
     type ColDef = { key: string; label: string; transform?: (v: any, row: any, i: number) => string };
     const cols: ColDef[] = [];
 
     cols.push({ key: '__rank', label: '#', transform: (_, _row, i) => String(i + 1) });
-
-    const first = results[0];
 
     if (isTeamMatch) {
       if (first?.team !== undefined) cols.push({ key: 'team', label: 'Team' });
